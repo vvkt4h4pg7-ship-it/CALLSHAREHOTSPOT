@@ -126,6 +126,19 @@ final class AppModel: ObservableObject {
         if contacts.authorization == .authorized { contacts.load() }
     }
 
+    // Standalone Wi-Fi audio playback test.
+    // Intentionally bypasses CallKit so J7 -> UDP -> iPhone speaker
+    // can be verified independently of CallKit audio activation timing.
+    func startWiFiPlaybackTest() {
+        log("[TEST] WIFI PLAYBACK TEST START")
+        wifiVoice.startStandaloneTest()
+    }
+
+    func stopWiFiPlaybackTest() {
+        wifiVoice.stop()
+        log("[TEST] WIFI PLAYBACK TEST STOP")
+    }
+
     func answerTest() { wifi.sendAnswer() }
 
     func makeCall() {

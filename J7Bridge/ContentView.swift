@@ -270,8 +270,8 @@ struct SettingsView: View {
                         Text("SIM 1").tag(0)
                         Text("SIM 2").tag(1)
                     }
-                    Button("Wi-Fi audio test") { app.wifiVoice.startStandaloneTest() }
-                    Button("Stop Wi-Fi audio test") { app.wifiVoice.stop() }
+                    Button("Wi-Fi audio test") { app.startWiFiPlaybackTest() }
+                    Button("Stop Wi-Fi audio test") { app.stopWiFiPlaybackTest() }
                     Button("Refresh J7 info") { app.requestDeviceInfo() }
                     HStack { Text("Battery"); Spacer(); Text(app.battery).foregroundStyle(.secondary) }
                     HStack { Text("Firmware"); Spacer(); Text(app.firmware).foregroundStyle(.secondary).lineLimit(1) }

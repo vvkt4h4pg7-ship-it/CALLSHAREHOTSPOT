@@ -52,14 +52,17 @@ final class WiFiVoiceEngine: NSObject {
 
     /// Standalone lab mode for the first milestone: no CallKit required.
     func startStandaloneTest() {
+        // LAB MODE: J7 -> UDP -> iPhone speaker only.
+        // No microphone tap, no converter, no CallKit dependency.
         configureSession(activate: true)
-        startEngine()
+        _ = startEngine(captureMic: false)
     }
 
     /// Real-call mode: CallKit's didActivate callback must have fired first.
     @discardableResult
     func start() -> Bool {
-        startEngine()
+        // REAL CALL MODE: CallKit is expected to have activated the session.
+        return startEngine(captureMic: true)
     }
 
     func stop() {
@@ -132,7 +135,7 @@ final class WiFiVoiceEngine: NSObject {
         }
     }
 
-    private func startEngine() -> Bool {
+    private func startEngine(captureMic: Bool) -> Bool {
         guard !isRunning else { return true }
 
         do {
@@ -146,21 +149,29 @@ final class WiFiVoiceEngine: NSObject {
             audioEngine.mainMixerNode.outputVolume = 1.0
 
             let input = audioEngine.inputNode
-            let inputFormat = input.inputFormat(forBus: 0)
-            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-                throw NSError(domain: "CALLSHARE.WiFiAudio", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "No microphone input route"])
-            }
 
-            converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-            guard converter != nil else {
-                throw NSError(domain: "CALLSHARE.WiFiAudio", code: 2,
-                              userInfo: [NSLocalizedDescriptionKey: "48 kHz stereo converter unavailable"])
-            }
+            if captureMic {
+                let inputFormat = input.inputFormat(forBus: 0)
+                guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                    throw NSError(domain: "CALLSHARE.WiFiAudio", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "No microphone input route"])
+                }
 
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 960, format: inputFormat) { [weak self] buffer, _ in
-                self?.capture(buffer)
+                converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+                guard converter != nil else {
+                    throw NSError(domain: "CALLSHARE.WiFiAudio", code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: "48 kHz stereo converter unavailable"])
+                }
+
+                input.removeTap(onBus: 0)
+                input.installTap(onBus: 0, bufferSize: 960, format: inputFormat) { [weak self] buffer, _ in
+                    self?.capture(buffer)
+                }
+            } else {
+                converter = nil
+                // Playback-only lab mode: do not touch the microphone/tap.
+                // This isolates J7 -> UDP -> iPhone speaker from CallKit/mic timing.
+                inputRemoveTapSafely()
             }
 
             playerNode.stop()
@@ -175,7 +186,18 @@ final class WiFiVoiceEngine: NSObject {
             playerNode.play()
             playbackQueue.async { [weak self] in self?.flushPreStartRX() }
             transport.sendVoiceOpen()
-            report("[WIFI_AUDIO] OPEN OK mic=\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch -> 48k/2ch")
+
+            let route = audioSession.currentRoute.outputs.map {
+                "\($0.portType.rawValue):\($0.portName)"
+            }.joined(separator: ", ")
+
+            if captureMic {
+                let input = audioEngine.inputNode
+                let inputFormat = input.inputFormat(forBus: 0)
+                report("[WIFI_AUDIO] OPEN OK mic=\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch -> 48k/2ch OUT=\(route)")
+            } else {
+                report("[WIFI_AUDIO] PLAYBACK-ONLY OK 48k stereo OUT=\(route)")
+            }
             return true
         } catch {
             isRunning = false
