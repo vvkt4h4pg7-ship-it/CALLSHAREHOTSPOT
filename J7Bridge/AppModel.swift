@@ -82,7 +82,12 @@ final class AppModel: ObservableObject {
             }
         }
         wifi.onAudioPCM = { [weak self] pcm, rate, channels, frames in
-            self?.wifiVoice.receivePCM(pcm, sampleRate: rate, channels: channels, frames: frames)
+            guard let self else { return }
+            // Audio is legal only after CallKit has activated the call audio session.
+            // J7 may be streaming PCM continuously, but idle/ringing audio must never
+            // reach the iPhone playback engine.
+            guard self.callStatus == "ACTIVE", self.callAudioActive else { return }
+            self.wifiVoice.receivePCM(pcm, sampleRate: rate, channels: channels, frames: frames)
         }
         wifiVoice.onStatus = { [weak self] status in
             Task { @MainActor [weak self] in
@@ -124,19 +129,6 @@ final class AppModel: ObservableObject {
     func start() {
         wifi.start()
         if contacts.authorization == .authorized { contacts.load() }
-    }
-
-    // Standalone Wi-Fi audio playback test.
-    // Intentionally bypasses CallKit so J7 -> UDP -> iPhone speaker
-    // can be verified independently of CallKit audio activation timing.
-    func startWiFiPlaybackTest() {
-        log("[TEST] WIFI PLAYBACK TEST START")
-        wifiVoice.startStandaloneTest()
-    }
-
-    func stopWiFiPlaybackTest() {
-        wifiVoice.stop()
-        log("[TEST] WIFI PLAYBACK TEST STOP")
     }
 
     func answerTest() { wifi.sendAnswer() }

@@ -270,8 +270,6 @@ struct SettingsView: View {
                         Text("SIM 1").tag(0)
                         Text("SIM 2").tag(1)
                     }
-                    Button("Wi-Fi audio test") { app.startWiFiPlaybackTest() }
-                    Button("Stop Wi-Fi audio test") { app.stopWiFiPlaybackTest() }
                     Button("Refresh J7 info") { app.requestDeviceInfo() }
                     HStack { Text("Battery"); Spacer(); Text(app.battery).foregroundStyle(.secondary) }
                     HStack { Text("Firmware"); Spacer(); Text(app.firmware).foregroundStyle(.secondary).lineLimit(1) }
@@ -297,7 +295,7 @@ struct SettingsView: View {
                         Text(app.voiceStatus == "CLOSED" ? "OFF — idle" : "ON — active call")
                             .foregroundStyle(.secondary)
                     }
-                    Text("Wi-Fi voice uses raw 48 kHz stereo PCM. Standalone test does not invoke CallKit; real calls start audio after CallKit activation.")
+                    Text("Wi-Fi voice uses raw 48 kHz stereo PCM. Audio and microphone are enabled only while a real CallKit call is ACTIVE and its audio session has been activated.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

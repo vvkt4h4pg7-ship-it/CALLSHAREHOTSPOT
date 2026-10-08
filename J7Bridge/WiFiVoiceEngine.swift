@@ -50,19 +50,10 @@ final class WiFiVoiceEngine: NSObject {
         report("[WIFI_AUDIO] SESSION PREPARED 48k stereo")
     }
 
-    /// Standalone lab mode for the first milestone: no CallKit required.
-    func startStandaloneTest() {
-        // LAB MODE: J7 -> UDP -> iPhone speaker only.
-        // No microphone tap, no converter, no CallKit dependency.
-        configureSession(activate: true)
-        _ = startEngine(captureMic: false)
-    }
-
     /// Real-call mode: CallKit's didActivate callback must have fired first.
     @discardableResult
     func start() -> Bool {
-        // REAL CALL MODE: CallKit is expected to have activated the session.
-        return startEngine(captureMic: true)
+        startEngine()
     }
 
     func stop() {
@@ -88,12 +79,9 @@ final class WiFiVoiceEngine: NSObject {
 
         playbackQueue.async { [weak self] in
             guard let self else { return }
-            if !self.isRunning || !self.audioEngine.isRunning {
-                if self.preStartRX.count >= self.maxPreStartRX { self.preStartRX.removeFirst() }
-                self.preStartRX.append((pcm, sampleRate, channels, frames))
-                if self.preStartRX.count == 1 {
-                    self.report("[WIFI_AUDIO] RX buffered before audio activation")
-                }
+            // Hard gate: never queue or play GSM PCM before CallKit activates audio.
+            // This prevents pre-answer / idle audio leakage and stale frames after activation.
+            guard self.isRunning, self.audioEngine.isRunning else {
                 return
             }
             self.playPCMNow(pcm, frames: frames)
@@ -135,7 +123,7 @@ final class WiFiVoiceEngine: NSObject {
         }
     }
 
-    private func startEngine(captureMic: Bool) -> Bool {
+    private func startEngine() -> Bool {
         guard !isRunning else { return true }
 
         do {
@@ -149,29 +137,21 @@ final class WiFiVoiceEngine: NSObject {
             audioEngine.mainMixerNode.outputVolume = 1.0
 
             let input = audioEngine.inputNode
+            let inputFormat = input.inputFormat(forBus: 0)
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                throw NSError(domain: "CALLSHARE.WiFiAudio", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "No microphone input route"])
+            }
 
-            if captureMic {
-                let inputFormat = input.inputFormat(forBus: 0)
-                guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-                    throw NSError(domain: "CALLSHARE.WiFiAudio", code: 1,
-                                  userInfo: [NSLocalizedDescriptionKey: "No microphone input route"])
-                }
+            converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+            guard converter != nil else {
+                throw NSError(domain: "CALLSHARE.WiFiAudio", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "48 kHz stereo converter unavailable"])
+            }
 
-                converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-                guard converter != nil else {
-                    throw NSError(domain: "CALLSHARE.WiFiAudio", code: 2,
-                                  userInfo: [NSLocalizedDescriptionKey: "48 kHz stereo converter unavailable"])
-                }
-
-                input.removeTap(onBus: 0)
-                input.installTap(onBus: 0, bufferSize: 960, format: inputFormat) { [weak self] buffer, _ in
-                    self?.capture(buffer)
-                }
-            } else {
-                converter = nil
-                // Playback-only lab mode: do not touch the microphone/tap.
-                // This isolates J7 -> UDP -> iPhone speaker from CallKit/mic timing.
-                inputRemoveTapSafely()
+            input.removeTap(onBus: 0)
+            input.installTap(onBus: 0, bufferSize: 960, format: inputFormat) { [weak self] buffer, _ in
+                self?.capture(buffer)
             }
 
             playerNode.stop()
@@ -186,18 +166,7 @@ final class WiFiVoiceEngine: NSObject {
             playerNode.play()
             playbackQueue.async { [weak self] in self?.flushPreStartRX() }
             transport.sendVoiceOpen()
-
-            let route = audioSession.currentRoute.outputs.map {
-                "\($0.portType.rawValue):\($0.portName)"
-            }.joined(separator: ", ")
-
-            if captureMic {
-                let input = audioEngine.inputNode
-                let inputFormat = input.inputFormat(forBus: 0)
-                report("[WIFI_AUDIO] OPEN OK mic=\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch -> 48k/2ch OUT=\(route)")
-            } else {
-                report("[WIFI_AUDIO] PLAYBACK-ONLY OK 48k stereo OUT=\(route)")
-            }
+            report("[WIFI_AUDIO] OPEN OK mic=\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch -> 48k/2ch")
             return true
         } catch {
             isRunning = false
