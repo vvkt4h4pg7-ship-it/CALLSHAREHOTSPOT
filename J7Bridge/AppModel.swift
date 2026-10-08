@@ -59,10 +59,11 @@ final class AppModel: ObservableObject {
         missedCallNotifications = UserDefaults.standard.object(forKey: "j7bridge.missedCallNotifications") as? Bool ?? true
         speakerDefault = UserDefaults.standard.object(forKey: "j7bridge.speakerDefault") as? Bool ?? true
         simSlot = UserDefaults.standard.object(forKey: "j7bridge.simSlot") as? Int ?? 0
-        j7Host = UserDefaults.standard.string(forKey: "j7bridge.j7Host") ?? "192.168.104.12"
+        let initialJ7Host = UserDefaults.standard.string(forKey: "j7bridge.j7Host") ?? "192.168.104.12"
+        j7Host = initialJ7Host
 
         callKit = CallKitManager()
-        wifi = WiFiTransport(j7Host: j7Host, port: 50005)
+        wifi = WiFiTransport(j7Host: initialJ7Host, port: 50005)
         wifiVoice = WiFiVoiceEngine(transport: wifi)
         contacts = ContactsManager()
         history = CallHistoryStore()
