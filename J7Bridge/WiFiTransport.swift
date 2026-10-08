@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Darwin
 
 final class WiFiTransport {
     enum Control: UInt8 {
@@ -38,6 +39,11 @@ final class WiFiTransport {
 
     private var listener: NWListener?
     private var uplink: NWConnection?
+    // R2: use a real UDP datagram socket for RX. This avoids NWConnection peer churn
+    // when the Android sender uses an ephemeral UDP source port.
+    private var rxSocket: Int32 = -1
+    private var rxDatagrams: UInt64 = 0
+    private var rxAudioDatagrams: UInt64 = 0
     private var sequence: UInt32 = 0
     private var pendingTX: [Data] = []
     private let maxPendingTX = 5
@@ -69,6 +75,13 @@ final class WiFiTransport {
             self.listener = nil
             self.uplink?.cancel()
             self.uplink = nil
+            if self.rxSocket >= 0 {
+                shutdown(self.rxSocket, SHUT_RDWR)
+                close(self.rxSocket)
+                self.rxSocket = -1
+            }
+            self.rxDatagrams = 0
+            self.rxAudioDatagrams = 0
             self.pendingTX.removeAll(keepingCapacity: false)
         }
     }
@@ -134,28 +147,81 @@ final class WiFiTransport {
     }
 
     private func startListener() {
-        do {
-            let parameters = NWParameters.udp
-            let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
-            self.listener = listener
+        // R2 intentionally uses a BSD UDP socket for RX instead of NWListener/NWConnection.
+        // NWConnection can create/tear down peer objects as the Android sender changes
+        // its ephemeral source port. A bound datagram socket receives every UDP packet
+        // addressed to port 50005 without that peer lifecycle.
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else {
+            onStatus?("[WIFI] UDP RX SOCKET ERROR errno=\(errno)")
+            return
+        }
 
-            listener.stateUpdateHandler = { [weak self] state in
-                self?.onStatus?("[WIFI] UDP LISTENER \(String(describing: state))")
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr = in_addr(s_addr: INADDR_ANY.bigEndian)
+
+        let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
+        }
 
-            listener.newConnectionHandler = { [weak self] connection in
-                guard let self else { return }
-                connection.stateUpdateHandler = { [weak self] state in
-                    self?.onStatus?("[WIFI] RX PEER \(String(describing: state))")
+        guard bindResult == 0 else {
+            onStatus?("[WIFI] UDP RX BIND ERROR port=\(port) errno=\(errno)")
+            close(fd)
+            return
+        }
+
+        rxSocket = fd
+        onStatus?("[WIFI] UDP RX SOCKET BOUND 0.0.0.0:\(port)")
+        rxQueue.async { [weak self] in
+            self?.receiveDatagrams(fd: fd)
+        }
+    }
+
+    private func receiveDatagrams(fd: Int32) {
+        var buffer = [UInt8](repeating: 0, count: 65535)
+
+        while true {
+            if rxSocket != fd { return }
+
+            var source = sockaddr_in()
+            var sourceLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let count = withUnsafeMutablePointer(to: &source) { sourcePtr -> Int in
+                sourcePtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sourceSockaddr in
+                    recvfrom(fd, &buffer, buffer.count, 0, sourceSockaddr, &sourceLen)
                 }
-                connection.start(queue: self.rxQueue)
-                self.receiveLoop(connection)
             }
 
-            listener.start(queue: rxQueue)
-            onStatus?("[WIFI] LISTENING UDP \(port)")
-        } catch {
-            onStatus?("[WIFI] LISTENER ERROR: \(error.localizedDescription)")
+            if count < 0 {
+                if errno == EINTR { continue }
+                if rxSocket == fd {
+                    onStatus?("[WIFI] UDP RX ERROR errno=\(errno)")
+                }
+                return
+            }
+
+            if count == 0 { continue }
+
+            rxDatagrams += 1
+            let data = Data(buffer[0..<count])
+            let isAudio = count >= 4 && buffer[0] == 0x4A && buffer[1] == 0x37 && buffer[2] == 0x57 && buffer[3] == 0x56
+            if isAudio {
+                rxAudioDatagrams += 1
+                if rxAudioDatagrams == 1 || rxAudioDatagrams % 50 == 0 {
+                    onStatus?("[WIFI_AUDIO] RX DATAGRAM #\(rxAudioDatagrams) len=\(count) total=\(rxDatagrams)")
+                }
+            } else if rxDatagrams <= 5 {
+                onStatus?("[WIFI] RX DATAGRAM #\(rxDatagrams) len=\(count)")
+            }
+
+            handleDatagram(data)
         }
     }
 
@@ -268,6 +334,9 @@ final class WiFiTransport {
             return
         }
 
+        if rxAudioDatagrams <= 3 {
+            onStatus?("[WIFI_AUDIO] RX VALID J7WV rate=\(sampleRate) ch=\(channels) frames=\(frames) pcm=\(payload.count)B")
+        }
         onAudioPCM?(payload, sampleRate, channels, frames)
     }
 
