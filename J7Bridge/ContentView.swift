@@ -264,7 +264,7 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section("IKOS K7") {
-                    HStack { Text("Status"); Spacer(); Text(app.bleStatus).foregroundStyle(.secondary) }
+                    HStack { Text("Status"); Spacer(); Text(app.wifiStatus).foregroundStyle(.secondary) }
                     HStack { Text("Device"); Spacer(); Text("J7 " + app.j7Host).foregroundStyle(.secondary) }
                     Picker("SIM slot", selection: $app.simSlot) {
                         Text("SIM 1").tag(0)
