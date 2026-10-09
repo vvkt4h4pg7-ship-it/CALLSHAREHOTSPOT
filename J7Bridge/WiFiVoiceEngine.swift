@@ -12,7 +12,7 @@ import Darwin
 /// - No VoiceProcessingIO is enabled in this first clean baseline, so the
 ///   J7 -> iPhone playback path is not subjected to a new system voice DSP mode.
 /// - Capture is read from inputNode.outputFormat(forBus: 0), converted to
-///   mono Float32 at 48 kHz, processed once, and explicitly duplicated to L/R.
+///   mono Float32 at 48 kHz, processed once, sent to L; R is zero for AEC-bypass experiment.
 /// - UDP protocol framing remains WiFiTransport's responsibility.
 final class WiFiVoiceEngine: NSObject {
     private static let sampleRate: Double = 48_000
@@ -46,14 +46,16 @@ final class WiFiVoiceEngine: NSObject {
 
     // Software mic processing. These are intentionally isolated from playback.
     private let highPassAlpha: Double = 0.9896       // ~80 Hz at 48 kHz
-    private let targetRMS: Double = 0.063            // about -24 dBFS; control loud packets without suppressing all TX samples
+    private let targetRMS: Double = 0.125            // about -18 dBFS
     private let maximumGain: Double = 32.0           // +30.1 dB ceiling
     private let minimumGain: Double = 0.35
     private let nearSilenceRMS: Double = 0.000025    // do not raise digital silence
     private let limiterKnee: Double = 0.72
     private let limiterCeiling: Double = 0.94
-    // No fixed post-leveler attenuation: quiet speech can already hit the 32x gain ceiling.
-    // A final 0.20x multiplier reduced that speech by another ~14 dB while strong blowing remained audible.
+    // Final attenuation is applied AFTER the leveler/limiter so the automatic
+    // leveler cannot compensate for it. 0.20x is about -14 dB on the J7 uplink.
+    // This only affects iPhone microphone PCM sent to J7, never J7 -> iPhone playback.
+    private let transmitAttenuation: Double = 0.20
     private var hpPreviousInput: Double = 0
     private var hpPreviousOutput: Double = 0
     private var currentMicGain: Double = 1.0
@@ -204,7 +206,7 @@ final class WiFiVoiceEngine: NSObject {
 
             playerNode.play()
             transport.sendVoiceOpen()
-            report("[WIFI_AUDIO] FRESH_R1 OPEN OK capture=\(Int(captureFormat.sampleRate))Hz/\(captureFormat.channelCount)ch format=\(captureFormat.commonFormat.rawValue) -> monoFloat/48000 -> S16LE dual-mono 48k/2ch")
+            report("[WIFI_AUDIO] AEC_BYPASS_TEST OPEN OK capture=\(Int(captureFormat.sampleRate))Hz/\(captureFormat.channelCount)ch format=\(captureFormat.commonFormat.rawValue) -> monoFloat/48000 -> S16LE dual-mono 48k/2ch")
             report("[WIFI_AUDIO] FRESH_R1 MIC TX path active; playback path unchanged; VPIO=off")
             return true
         } catch {
@@ -216,7 +218,7 @@ final class WiFiVoiceEngine: NSObject {
             playerNode.stop()
             micConverter = nil
             micInputFormat = nil
-            report("[WIFI_AUDIO] FRESH_R1 START ERROR: \(error.localizedDescription)")
+            report("[WIFI_AUDIO] AEC_BYPASS_TEST START ERROR: \(error.localizedDescription)")
             return false
         }
     }
@@ -265,7 +267,7 @@ final class WiFiVoiceEngine: NSObject {
             transport.sendAudioPCM(processed.data, sampleRate: 48_000, channels: 2, frames: UInt16(Self.packetFrames))
 
             if txFrames == 1 || txFrames % 50 == 0 {
-                report(String(format: "[WIFI_AUDIO] FRESH_R1 MIC TX #%d gain=%.2fx targetRMS=-24dBFS rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS outPeak=%.1f dBFS", txFrames, processed.gain, processed.rawRMSDBFS, processed.highPassRMSDBFS, processed.outputRMSDBFS, processed.outputPeakDBFS))
+                report(String(format: "[WIFI_AUDIO] AEC_BYPASS_TEST MIC TX #%d gain=%.2fx txAtten=%.2fx rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS outPeak=%.1f dBFS", txFrames, processed.gain, transmitAttenuation, processed.rawRMSDBFS, processed.highPassRMSDBFS, processed.outputRMSDBFS, processed.outputPeakDBFS))
             }
         }
     }
@@ -336,20 +338,22 @@ final class WiFiVoiceEngine: NSObject {
                     limitedMagnitude = limiterKnee + span * (1.0 - exp(-(magnitude - limiterKnee) / span))
                 }
                 let limited = boosted < 0 ? -limitedMagnitude : limitedMagnitude
-                // Do not apply fixed post-leveler attenuation: it suppresses quiet speech
-                // even when the leveler has already reached its maximum gain.
-                let normalized = max(-1.0, min(32767.0 / 32768.0, limited))
+                // Attenuate the FINAL processed sample. Applying attenuation before
+                // the leveler would be undone by targetRMS gain compensation.
+                let attenuated = limited * transmitAttenuation
+                let normalized = max(-1.0, min(32767.0 / 32768.0, attenuated))
                 let quantized = Int16((normalized * 32768.0).rounded())
                 let bits = UInt16(bitPattern: quantized)
                 let offset = index * 4
 
-                // Explicit little-endian dual mono: L sample then identical R sample.
+                // Experimental AEC-bypass test: processed mic on L, digital silence on R.
+                // Keep the J7WV wire packet size and little-endian S16 format unchanged.
                 let lo = UInt8(truncatingIfNeeded: bits)
                 let hi = UInt8(truncatingIfNeeded: bits >> 8)
                 bytes[offset] = lo
                 bytes[offset + 1] = hi
-                bytes[offset + 2] = lo
-                bytes[offset + 3] = hi
+                bytes[offset + 2] = 0
+                bytes[offset + 3] = 0
 
                 let sampleOut = Double(quantized) / 32768.0
                 outputSumSquares += sampleOut * sampleOut
