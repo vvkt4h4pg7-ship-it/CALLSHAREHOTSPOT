@@ -265,29 +265,17 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("IKOS K7") {
-                    HStack { Text("Status"); Spacer(); Text(app.wifiStatus).foregroundStyle(.secondary) }
-                    HStack { Text("Device"); Spacer(); Text("J7 " + app.j7Host).foregroundStyle(.secondary) }
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("J7 Hotspot IP")
-                        TextField("192.168.45.94", text: $j7HostDraft)
-                            .keyboardType(.decimalPad)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        Button("Save J7 IP") {
-                            saveJ7Host()
-                        }
-                        if let j7HostError {
-                            Text(j7HostError)
-                                .font(.footnote)
-                                .foregroundStyle(.red)
-                        }
-                        Text("Enter the J7's current hotspot IPv4 address. The setting is saved on this iPhone.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
+                Section {
+                    HStack {
+                        Text("Status")
+                        Spacer()
+                        Text(app.wifiStatus).foregroundStyle(.secondary)
                     }
-
+                    HStack {
+                        Text("Device")
+                        Spacer()
+                        Text("J7 " + app.j7Host).foregroundStyle(.secondary)
+                    }
                     Picker("SIM slot", selection: $app.simSlot) {
                         Text("SIM 1").tag(0)
                         Text("SIM 2").tag(1)
@@ -295,24 +283,62 @@ struct SettingsView: View {
                     Button("Wi-Fi audio test") { app.wifiVoice.startStandaloneTest() }
                     Button("Stop Wi-Fi audio test") { app.wifiVoice.stop() }
                     Button("Refresh J7 info") { app.requestDeviceInfo() }
-                    HStack { Text("Battery"); Spacer(); Text(app.battery).foregroundStyle(.secondary) }
-                    HStack { Text("Firmware"); Spacer(); Text(app.firmware).foregroundStyle(.secondary).lineLimit(1) }
-                    HStack { Text("IMEI"); Spacer(); Text(app.imei).foregroundStyle(.secondary) }
+                    HStack {
+                        Text("Battery")
+                        Spacer()
+                        Text(app.battery).foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("Firmware")
+                        Spacer()
+                        Text(app.firmware).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    HStack {
+                        Text("IMEI")
+                        Spacer()
+                        Text(app.imei).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("IKOS K7")
                 }
 
-                Section("Calling") {
+                Section {
+                    TextField("192.168.45.94", text: $j7HostDraft)
+                        .keyboardType(.decimalPad)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button("Save J7 IP") {
+                        saveJ7Host()
+                    }
+                    if let error = j7HostError {
+                        Text(error)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                    Text("Enter the J7's current hotspot IPv4 address. The setting is saved on this iPhone.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("J7 Hotspot IP")
+                }
+
+                Section {
                     Toggle("Auto-start Wi-Fi", isOn: $app.autoConnect)
                     Toggle("Resolve caller names", isOn: $app.resolveCallerNames)
                     Toggle("Missed-call notifications", isOn: $app.missedCallNotifications)
                     Toggle("Speaker by default", isOn: $app.speakerDefault)
+                } header: {
+                    Text("Calling")
                 }
 
-                Section("Permissions") {
+                Section {
                     Button("Allow Contacts") { app.requestContacts() }
                     Button("Allow Notifications") { app.notifications.requestPermission() }
+                } header: {
+                    Text("Permissions")
                 }
 
-                Section("Audio") {
+                Section {
                     HStack {
                         Text("Microphone")
                         Spacer()
@@ -322,17 +348,27 @@ struct SettingsView: View {
                     Text("Wi-Fi voice uses raw 48 kHz stereo PCM. Standalone test does not invoke CallKit; real calls start audio after CallKit activation.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                } header: {
+                    Text("Audio")
                 }
 
-                Section("Diagnostics") {
+                Section {
                     NavigationLink("Live Log") { DiagnosticLogView() }
+                } header: {
+                    Text("Diagnostics")
                 }
 
-                Section("About") {
-                    HStack { Text("CALLSHARE"); Spacer(); Text("Wi-Fi R1") }
+                Section {
+                    HStack {
+                        Text("CALLSHARE")
+                        Spacer()
+                        Text("Wi-Fi R1")
+                    }
                     Text("UDP 50005 • J7WV raw PCM")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                } header: {
+                    Text("About")
                 }
             }
             .navigationTitle("Settings")
