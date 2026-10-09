@@ -259,6 +259,8 @@ struct EmptyStateView: View {
 
 struct SettingsView: View {
     @EnvironmentObject var app: AppModel
+    @State private var j7HostDraft = ""
+    @State private var j7HostError: String?
 
     var body: some View {
         NavigationStack {
@@ -266,10 +268,32 @@ struct SettingsView: View {
                 Section("IKOS K7") {
                     HStack { Text("Status"); Spacer(); Text(app.wifiStatus).foregroundStyle(.secondary) }
                     HStack { Text("Device"); Spacer(); Text("J7 " + app.j7Host).foregroundStyle(.secondary) }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("J7 Hotspot IP")
+                        TextField("192.168.45.94", text: $j7HostDraft)
+                            .keyboardType(.decimalPad)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Button("Save J7 IP") {
+                            saveJ7Host()
+                        }
+                        if let j7HostError {
+                            Text(j7HostError)
+                                .font(.footnote)
+                                .foregroundStyle(.red)
+                        }
+                        Text("Enter the J7's current hotspot IPv4 address. The setting is saved on this iPhone.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
                     Picker("SIM slot", selection: $app.simSlot) {
                         Text("SIM 1").tag(0)
                         Text("SIM 2").tag(1)
                     }
+                    Button("Wi-Fi audio test") { app.wifiVoice.startStandaloneTest() }
+                    Button("Stop Wi-Fi audio test") { app.wifiVoice.stop() }
                     Button("Refresh J7 info") { app.requestDeviceInfo() }
                     HStack { Text("Battery"); Spacer(); Text(app.battery).foregroundStyle(.secondary) }
                     HStack { Text("Firmware"); Spacer(); Text(app.firmware).foregroundStyle(.secondary).lineLimit(1) }
@@ -295,7 +319,7 @@ struct SettingsView: View {
                         Text(app.voiceStatus == "CLOSED" ? "OFF — idle" : "ON — active call")
                             .foregroundStyle(.secondary)
                     }
-                    Text("Wi-Fi voice uses raw 48 kHz stereo PCM. Audio and microphone are enabled only while a real CallKit call is ACTIVE and its audio session has been activated.")
+                    Text("Wi-Fi voice uses raw 48 kHz stereo PCM. Standalone test does not invoke CallKit; real calls start audio after CallKit activation.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -312,7 +336,31 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .onAppear {
+                if j7HostDraft.isEmpty {
+                    j7HostDraft = app.j7Host
+                }
+            }
         }
+    }
+
+    private func saveJ7Host() {
+        let cleaned = j7HostDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let octets = cleaned.split(separator: ".", omittingEmptySubsequences: false)
+        let validIPv4 = octets.count == 4 && octets.allSatisfy { part in
+            guard let number = Int(part) else { return false }
+            return (0...255).contains(number)
+        }
+
+        guard validIPv4 else {
+            j7HostError = "Enter a valid IPv4 address, e.g. 192.168.45.94."
+            return
+        }
+
+        let normalized = octets.map { String($0) }.joined(separator: ".")
+        app.j7Host = normalized
+        j7HostDraft = normalized
+        j7HostError = nil
     }
 }
 
