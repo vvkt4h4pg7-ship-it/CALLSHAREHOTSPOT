@@ -19,6 +19,10 @@ final class WiFiVoiceEngine: NSObject {
     private var useSpeaker = true
     private var muted = false
 
+    // Outgoing iPhone microphone -> J7 -> GSM gain. Applied after conversion to
+    // interleaved S16_LE stereo, just before UDP transmission. No playback-path changes.
+    private let micPreGain: Double = 5.0
+
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: 48_000,
@@ -209,16 +213,86 @@ final class WiFiVoiceEngine: NSObject {
         let frameBytes = 960 * 2 * 2
 
         while pcmAccumulator.count >= frameBytes {
-            let frame = pcmAccumulator.prefix(frameBytes)
-            let data = Data(frame)
+            let frame = Data(pcmAccumulator.prefix(frameBytes))
             pcmAccumulator.removeFirst(frameBytes)
+
+            // Process the final 20 ms packet in its known format: interleaved S16_LE stereo.
+            // This avoids int16ChannelData indexing against an interleaved AVAudioBuffer.
+            let processed = applyMicGainAndSoftClip(frame, preGain: micPreGain)
             txFrames += 1
-            transport.sendAudioPCM(data)
+            transport.sendAudioPCM(processed.data)
 
             if txFrames == 1 || txFrames % 50 == 0 {
-                report("[WIFI_AUDIO] TX PCM #\(txFrames) 3840B")
+                report(String(format: "[WIFI_AUDIO] TX PCM #%d 3840B gain=%.1fx preRMS=%.1f dBFS postRMS=%.1f dBFS prePeak=%.1f dBFS postPeak=%.1f dBFS",
+                              txFrames, micPreGain, processed.preRMSDBFS, processed.postRMSDBFS,
+                              processed.prePeakDBFS, processed.postPeakDBFS))
             }
         }
+    }
+
+    private struct MicPCMResult {
+        let data: Data
+        let preRMSDBFS: Double
+        let postRMSDBFS: Double
+        let prePeakDBFS: Double
+        let postPeakDBFS: Double
+    }
+
+    /// Applies 5x gain with tanh soft-clipping to one 20 ms S16_LE interleaved stereo packet.
+    /// This is only the iPhone microphone uplink; J7 -> iPhone playback is untouched.
+    private func applyMicGainAndSoftClip(_ pcm: Data, preGain: Double) -> MicPCMResult {
+        var output = pcm
+        var preSumSquares = 0.0
+        var postSumSquares = 0.0
+        var prePeak = 0.0
+        var postPeak = 0.0
+        var sampleCount = 0
+
+        output.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            sampleCount = bytes.count / MemoryLayout<Int16>.size
+            guard sampleCount > 0 else { return }
+
+            for sampleIndex in 0..<sampleCount {
+                let offset = sampleIndex * 2
+                // The target PCM is S16_LE. Read/write explicitly so no alignment assumptions are made.
+                let bits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+                let sample = Int16(bitPattern: bits)
+                let normalized = Double(sample) / 32768.0
+
+                preSumSquares += normalized * normalized
+                prePeak = max(prePeak, abs(normalized))
+
+                // At low levels this approaches linear 5x gain; louder peaks are smoothly limited.
+                let shaped = tanh(normalized * preGain)
+                let rounded = (shaped * 32768.0).rounded()
+                let bounded = Int32(max(-32768.0, min(32767.0, rounded)))
+                let processedSample = Int16(bounded)
+                let outBits = UInt16(bitPattern: processedSample)
+                bytes[offset] = UInt8(truncatingIfNeeded: outBits)
+                bytes[offset + 1] = UInt8(truncatingIfNeeded: outBits >> 8)
+
+                let outNormalized = Double(processedSample) / 32768.0
+                postSumSquares += outNormalized * outNormalized
+                postPeak = max(postPeak, abs(outNormalized))
+            }
+        }
+
+        let divisor = Double(max(sampleCount, 1))
+        let preRMS = sqrt(preSumSquares / divisor)
+        let postRMS = sqrt(postSumSquares / divisor)
+        return MicPCMResult(
+            data: output,
+            preRMSDBFS: levelDBFS(preRMS),
+            postRMSDBFS: levelDBFS(postRMS),
+            prePeakDBFS: levelDBFS(prePeak),
+            postPeakDBFS: levelDBFS(postPeak)
+        )
+    }
+
+    private func levelDBFS(_ normalizedLevel: Double) -> Double {
+        guard normalizedLevel > 0 else { return -120.0 }
+        return 20.0 * log10(normalizedLevel)
     }
 
     private func interleavedPCMData(from buffer: AVAudioPCMBuffer) -> Data? {
