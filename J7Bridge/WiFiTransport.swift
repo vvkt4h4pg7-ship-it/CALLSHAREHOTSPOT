@@ -39,6 +39,10 @@ final class WiFiTransport {
 
     private var listener: NWListener?
     private var uplink: NWConnection?
+    // Control commands go to Android ControlUdpService on UDP 50006.
+    // Keep the proven BSD-socket RX and audio uplink path unchanged.
+    private var controlUplink: NWConnection?
+    private let controlTxPort: UInt16 = 50006
     // R2: use a real UDP datagram socket for RX. This avoids NWConnection peer churn
     // when the Android sender uses an ephemeral UDP source port.
     private var rxSocket: Int32 = -1
@@ -46,6 +50,7 @@ final class WiFiTransport {
     private var rxAudioDatagrams: UInt64 = 0
     private var sequence: UInt32 = 0
     private var pendingTX: [Data] = []
+    private var pendingControlTX: [Data] = []
     private let maxPendingTX = 5
     private var started = false
 
@@ -64,6 +69,7 @@ final class WiFiTransport {
             self.started = true
             self.startListener()
             self.startUplink()
+            self.startControlUplink()
         }
     }
 
@@ -75,6 +81,8 @@ final class WiFiTransport {
             self.listener = nil
             self.uplink?.cancel()
             self.uplink = nil
+            self.controlUplink?.cancel()
+            self.controlUplink = nil
             if self.rxSocket >= 0 {
                 shutdown(self.rxSocket, SHUT_RDWR)
                 close(self.rxSocket)
@@ -83,6 +91,7 @@ final class WiFiTransport {
             self.rxDatagrams = 0
             self.rxAudioDatagrams = 0
             self.pendingTX.removeAll(keepingCapacity: false)
+            self.pendingControlTX.removeAll(keepingCapacity: false)
         }
     }
 
@@ -95,7 +104,12 @@ final class WiFiTransport {
             self._j7Host = cleaned
             self.uplink?.cancel()
             self.uplink = nil
-            if self.started { self.startUplink() }
+            self.controlUplink?.cancel()
+            self.controlUplink = nil
+            if self.started {
+                self.startUplink()
+                self.startControlUplink()
+            }
             self.onStatus?("[WIFI] J7 HOST = \(cleaned)")
         }
     }
@@ -248,6 +262,27 @@ final class WiFiTransport {
         connection.start(queue: txQueue)
     }
 
+    private func startControlUplink() {
+        let connection = NWConnection(
+            host: NWEndpoint.Host(j7Host),
+            port: NWEndpoint.Port(rawValue: controlTxPort)!,
+            using: .udp
+        )
+        controlUplink = connection
+
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            self.onStatus?("[WIFI] CONTROL UPLINK \(String(describing: state)) port=\(self.controlTxPort)")
+            if case .ready = state {
+                self.flushPendingControlTX()
+            } else if case .failed = state {
+                connection.cancel()
+                if self.controlUplink === connection { self.controlUplink = nil }
+            }
+        }
+        connection.start(queue: txQueue)
+    }
+
     private func receiveLoop(_ connection: NWConnection) {
         connection.receiveMessage { [weak self] data, _, _, error in
             guard let self else { return }
@@ -344,7 +379,7 @@ final class WiFiTransport {
         txQueue.async { [weak self] in
             guard let self else { return }
             let packet = self.makeControlPacket(type: control, payload: payload)
-            self.enqueueOrSend(packet)
+            self.enqueueControlOrSend(packet)
         }
     }
 
@@ -367,6 +402,30 @@ final class WiFiTransport {
         let items = pendingTX
         pendingTX.removeAll(keepingCapacity: true)
         for item in items { enqueueOrSend(item) }
+    }
+
+    private func enqueueControlOrSend(_ packet: Data) {
+        guard let controlUplink else {
+            if pendingControlTX.count >= maxPendingTX { pendingControlTX.removeFirst() }
+            pendingControlTX.append(packet)
+            onStatus?("[WIFI] CONTROL TX QUEUED port=\(controlTxPort)")
+            return
+        }
+
+        controlUplink.send(content: packet, completion: .contentProcessed { [weak self] error in
+            if let error {
+                self?.onStatus?("[WIFI] CONTROL TX ERROR: \(error.localizedDescription)")
+            } else {
+                self?.onStatus?("[WIFI] CONTROL TX SENT len=\(packet.count) port=\(self?.controlTxPort ?? 50006)")
+            }
+        })
+    }
+
+    private func flushPendingControlTX() {
+        guard !pendingControlTX.isEmpty else { return }
+        let items = pendingControlTX
+        pendingControlTX.removeAll(keepingCapacity: true)
+        for item in items { enqueueControlOrSend(item) }
     }
 
     private func makeControlPacket(type: Control, payload: Data) -> Data {
