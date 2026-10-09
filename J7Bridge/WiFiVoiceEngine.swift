@@ -46,7 +46,7 @@ final class WiFiVoiceEngine: NSObject {
 
     // Software mic processing. These are intentionally isolated from playback.
     private let highPassAlpha: Double = 0.9896       // ~80 Hz at 48 kHz
-    private let targetRMS: Double = 0.125            // about -18 dBFS
+    private let targetRMS: Double = 0.063            // about -24 dBFS; 6 dB lower test target to reduce J7 uplink overdrive
     private let maximumGain: Double = 32.0           // +30.1 dB ceiling
     private let minimumGain: Double = 0.35
     private let nearSilenceRMS: Double = 0.000025    // do not raise digital silence
