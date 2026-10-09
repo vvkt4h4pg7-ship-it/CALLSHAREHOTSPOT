@@ -19,9 +19,20 @@ final class WiFiVoiceEngine: NSObject {
     private var useSpeaker = true
     private var muted = false
 
-    // Outgoing iPhone microphone -> J7 -> GSM gain. Applied after conversion to
-    // interleaved S16_LE stereo, just before UDP transmission. No playback-path changes.
-    private let micPreGain: Double = 5.0
+    // iPhone microphone uplink only. The existing AVAudioSession, CallKit activation,
+    // UDP framing, and J7 -> iPhone playback path are intentionally unchanged.
+    // A per-packet leveler supplies makeup gain because .voiceChat without Voice Processing I/O
+    // does not guarantee system AGC. Gain is capped and followed by a soft limiter.
+    private let micHighPassAlpha: Double = 0.9856 // approximately 110 Hz at 48 kHz
+    private let micTargetRMS: Double = 0.125      // about -18 dBFS
+    private let micMaxGain: Double = 18.0         // maximum boost: about +25 dB
+    private let micMinGain: Double = 0.35         // allow attenuation of loud wind/plosives
+    private let micGateRMS: Double = 0.0010       // avoid amplifying idle noise (~-60 dBFS)
+    private let micLimiterKnee: Double = 0.72
+    private let micLimiterCeiling: Double = 0.94
+    private var micHPPrevX: Double = 0.0
+    private var micHPPrevY: Double = 0.0
+    private var micCurrentGain: Double = 1.0
 
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
@@ -163,6 +174,9 @@ final class WiFiVoiceEngine: NSObject {
             txFrames = 0
             rxFrames = 0
             pcmAccumulator.removeAll(keepingCapacity: true)
+            micHPPrevX = 0.0
+            micHPPrevY = 0.0
+            micCurrentGain = 1.0
 
             audioEngine.prepare()
             try audioEngine.start()
@@ -218,76 +232,144 @@ final class WiFiVoiceEngine: NSObject {
 
             // Process the final 20 ms packet in its known format: interleaved S16_LE stereo.
             // This avoids int16ChannelData indexing against an interleaved AVAudioBuffer.
-            let processed = applyMicGainAndSoftClip(frame, preGain: micPreGain)
+            let processed = applyMicSpeechLeveler(frame)
             txFrames += 1
             transport.sendAudioPCM(processed.data)
 
             if txFrames == 1 || txFrames % 50 == 0 {
-                report(String(format: "[WIFI_AUDIO] TX PCM #%d 3840B gain=%.1fx preRMS=%.1f dBFS postRMS=%.1f dBFS prePeak=%.1f dBFS postPeak=%.1f dBFS",
-                              txFrames, micPreGain, processed.preRMSDBFS, processed.postRMSDBFS,
-                              processed.prePeakDBFS, processed.postPeakDBFS))
+                report(String(format: "[WIFI_AUDIO] MIC LEVELER TX #%d gain=%.2fx rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS rawPeak=%.1f dBFS outPeak=%.1f dBFS",
+                              txFrames, processed.gain, processed.inputRMSDBFS, processed.filteredRMSDBFS,
+                              processed.outputRMSDBFS, processed.inputPeakDBFS, processed.outputPeakDBFS))
             }
         }
     }
 
     private struct MicPCMResult {
         let data: Data
-        let preRMSDBFS: Double
-        let postRMSDBFS: Double
-        let prePeakDBFS: Double
-        let postPeakDBFS: Double
+        let inputRMSDBFS: Double
+        let filteredRMSDBFS: Double
+        let outputRMSDBFS: Double
+        let inputPeakDBFS: Double
+        let outputPeakDBFS: Double
+        let gain: Double
     }
 
-    /// Applies 5x gain with tanh soft-clipping to one 20 ms S16_LE interleaved stereo packet.
-    /// This is only the iPhone microphone uplink; J7 -> iPhone playback is untouched.
-    private func applyMicGainAndSoftClip(_ pcm: Data, preGain: Double) -> MicPCMResult {
+    /// Processes ONLY iPhone microphone uplink PCM, after conversion and before UDP TX.
+    /// Input packet is 20 ms, 48 kHz, interleaved S16_LE stereo (L,R,L,R...).
+    /// The active route has previously reported a mono mic input, so use the converted
+    /// left sample as the mono source and explicitly write it to both output channels.
+    /// A high-pass attenuates wind/handling rumble; a smoothed RMS leveler lifts ordinary speech;
+    /// a soft limiter controls strong peaks. No playback code is touched.
+    private func applyMicSpeechLeveler(_ pcm: Data) -> MicPCMResult {
         var output = pcm
-        var preSumSquares = 0.0
-        var postSumSquares = 0.0
-        var prePeak = 0.0
-        var postPeak = 0.0
-        var sampleCount = 0
+        var inputSumSquares = 0.0
+        var filteredSumSquares = 0.0
+        var inputPeak = 0.0
+        let frameCount = pcm.count / 4 // two Int16 samples per stereo frame
+        var metrics = (-120.0, -120.0, -120.0, -120.0, -120.0, 1.0)
+        let startHPX = micHPPrevX
+        let startHPY = micHPPrevY
 
         output.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             let bytes = raw.bindMemory(to: UInt8.self)
-            sampleCount = bytes.count / MemoryLayout<Int16>.size
-            guard sampleCount > 0 else { return }
+            guard frameCount > 0, bytes.count >= frameCount * 4 else { return }
 
-            for sampleIndex in 0..<sampleCount {
-                let offset = sampleIndex * 2
-                // The target PCM is S16_LE. Read/write explicitly so no alignment assumptions are made.
+            // Pass 1: inspect original left-channel PCM and measure the level. No per-packet
+            // sample-array allocation is needed on the real-time audio callback.
+            var hpX = startHPX
+            var hpY = startHPY
+            for frame in 0..<frameCount {
+                let offset = frame * 4
                 let bits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
                 let sample = Int16(bitPattern: bits)
-                let normalized = Double(sample) / 32768.0
+                let x = Double(sample) / 32768.0
+                inputSumSquares += x * x
+                inputPeak = max(inputPeak, abs(x))
 
-                preSumSquares += normalized * normalized
-                prePeak = max(prePeak, abs(normalized))
+                let y = micHighPassAlpha * (hpY + x - hpX)
+                hpX = x
+                hpY = y
+                filteredSumSquares += y * y
+            }
+            micHPPrevX = hpX
+            micHPPrevY = hpY
 
-                // At low levels this approaches linear 5x gain; louder peaks are smoothly limited.
-                let shaped = tanh(normalized * preGain)
-                let rounded = (shaped * 32768.0).rounded()
-                let bounded = Int32(max(-32768.0, min(32767.0, rounded)))
-                let processedSample = Int16(bounded)
-                let outBits = UInt16(bitPattern: processedSample)
+            let divisor = Double(max(frameCount, 1))
+            let inputRMS = sqrt(inputSumSquares / divisor)
+            let filteredRMS = sqrt(filteredSumSquares / divisor)
+
+            // Target about -18 dBFS. Unlike fixed makeup gain, this can attenuate loud gusts
+            // as well as raise speech, while still limiting maximum boost to 18x.
+            let desiredGain: Double
+            if filteredRMS < micGateRMS {
+                desiredGain = 1.0
+            } else {
+                desiredGain = min(micMaxGain, max(micMinGain, micTargetRMS / max(filteredRMS, 1.0e-6)))
+            }
+
+            // Quiet speech gets fast-but-smoothed gain-up. Loud transients trigger near-immediate
+            // gain reduction so a close breath cannot inherit several packets of high speech gain.
+            let smoothing: Double
+            if filteredRMS < micGateRMS {
+                smoothing = 0.85
+            } else if desiredGain > micCurrentGain {
+                smoothing = 0.38
+            } else {
+                smoothing = 0.92
+            }
+            micCurrentGain += (desiredGain - micCurrentGain) * smoothing
+            micCurrentGain = min(micMaxGain, max(micMinGain, micCurrentGain))
+
+            // Pass 2: apply the same high-pass from the packet's original filter state, gain,
+            // limiter, and dual-mono mapping. Both channels are written identically.
+            hpX = startHPX
+            hpY = startHPY
+            var outputSumSquares = 0.0
+            var outputPeak = 0.0
+            for frame in 0..<frameCount {
+                let offset = frame * 4
+                let inBits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+                let inputSample = Int16(bitPattern: inBits)
+                let x = Double(inputSample) / 32768.0
+                let filtered = micHighPassAlpha * (hpY + x - hpX)
+                hpX = x
+                hpY = filtered
+
+                let boosted = filtered * micCurrentGain
+                let magnitude = abs(boosted)
+                let limitedMagnitude: Double
+                if magnitude <= micLimiterKnee {
+                    limitedMagnitude = magnitude
+                } else {
+                    let span = micLimiterCeiling - micLimiterKnee
+                    let excess = magnitude - micLimiterKnee
+                    limitedMagnitude = micLimiterKnee + span * (1.0 - exp(-excess / span))
+                }
+                let limited = boosted < 0.0 ? -limitedMagnitude : limitedMagnitude
+                let bounded = Int32(max(-32768.0, min(32767.0, (limited * 32768.0).rounded())))
+                let result = Int16(bounded)
+                let outBits = UInt16(bitPattern: result)
+
                 bytes[offset] = UInt8(truncatingIfNeeded: outBits)
                 bytes[offset + 1] = UInt8(truncatingIfNeeded: outBits >> 8)
+                bytes[offset + 2] = UInt8(truncatingIfNeeded: outBits)
+                bytes[offset + 3] = UInt8(truncatingIfNeeded: outBits >> 8)
 
-                let outNormalized = Double(processedSample) / 32768.0
-                postSumSquares += outNormalized * outNormalized
-                postPeak = max(postPeak, abs(outNormalized))
+                let normalized = Double(result) / 32768.0
+                outputSumSquares += normalized * normalized
+                outputPeak = max(outputPeak, abs(normalized))
             }
+
+            let outputRMS = sqrt(outputSumSquares / divisor)
+            metrics = (
+                levelDBFS(inputRMS), levelDBFS(filteredRMS), levelDBFS(outputRMS),
+                levelDBFS(inputPeak), levelDBFS(outputPeak), micCurrentGain
+            )
         }
 
-        let divisor = Double(max(sampleCount, 1))
-        let preRMS = sqrt(preSumSquares / divisor)
-        let postRMS = sqrt(postSumSquares / divisor)
-        return MicPCMResult(
-            data: output,
-            preRMSDBFS: levelDBFS(preRMS),
-            postRMSDBFS: levelDBFS(postRMS),
-            prePeakDBFS: levelDBFS(prePeak),
-            postPeakDBFS: levelDBFS(postPeak)
-        )
+        return MicPCMResult(data: output, inputRMSDBFS: metrics.0, filteredRMSDBFS: metrics.1,
+                            outputRMSDBFS: metrics.2, inputPeakDBFS: metrics.3,
+                            outputPeakDBFS: metrics.4, gain: metrics.5)
     }
 
     private func levelDBFS(_ normalizedLevel: Double) -> Double {
