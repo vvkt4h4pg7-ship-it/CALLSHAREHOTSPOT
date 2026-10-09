@@ -46,12 +46,16 @@ final class WiFiVoiceEngine: NSObject {
 
     // Software mic processing. These are intentionally isolated from playback.
     private let highPassAlpha: Double = 0.9896       // ~80 Hz at 48 kHz
-    private let targetRMS: Double = 0.063            // about -24 dBFS; 6 dB lower test target to reduce J7 uplink overdrive
+    private let targetRMS: Double = 0.125            // about -18 dBFS
     private let maximumGain: Double = 32.0           // +30.1 dB ceiling
     private let minimumGain: Double = 0.35
     private let nearSilenceRMS: Double = 0.000025    // do not raise digital silence
     private let limiterKnee: Double = 0.72
     private let limiterCeiling: Double = 0.94
+    // Final attenuation is applied AFTER the leveler/limiter so the automatic
+    // leveler cannot compensate for it. 0.20x is about -14 dB on the J7 uplink.
+    // This only affects iPhone microphone PCM sent to J7, never J7 -> iPhone playback.
+    private let transmitAttenuation: Double = 0.20
     private var hpPreviousInput: Double = 0
     private var hpPreviousOutput: Double = 0
     private var currentMicGain: Double = 1.0
@@ -263,7 +267,7 @@ final class WiFiVoiceEngine: NSObject {
             transport.sendAudioPCM(processed.data, sampleRate: 48_000, channels: 2, frames: UInt16(Self.packetFrames))
 
             if txFrames == 1 || txFrames % 50 == 0 {
-                report(String(format: "[WIFI_AUDIO] FRESH_R1 MIC TX #%d gain=%.2fx rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS outPeak=%.1f dBFS", txFrames, processed.gain, processed.rawRMSDBFS, processed.highPassRMSDBFS, processed.outputRMSDBFS, processed.outputPeakDBFS))
+                report(String(format: "[WIFI_AUDIO] FRESH_R1 MIC TX #%d gain=%.2fx txAtten=%.2fx rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS outPeak=%.1f dBFS", txFrames, processed.gain, transmitAttenuation, processed.rawRMSDBFS, processed.highPassRMSDBFS, processed.outputRMSDBFS, processed.outputPeakDBFS))
             }
         }
     }
@@ -334,7 +338,10 @@ final class WiFiVoiceEngine: NSObject {
                     limitedMagnitude = limiterKnee + span * (1.0 - exp(-(magnitude - limiterKnee) / span))
                 }
                 let limited = boosted < 0 ? -limitedMagnitude : limitedMagnitude
-                let normalized = max(-1.0, min(32767.0 / 32768.0, limited))
+                // Attenuate the FINAL processed sample. Applying attenuation before
+                // the leveler would be undone by targetRMS gain compensation.
+                let attenuated = limited * transmitAttenuation
+                let normalized = max(-1.0, min(32767.0 / 32768.0, attenuated))
                 let quantized = Int16((normalized * 32768.0).rounded())
                 let bits = UInt16(bitPattern: quantized)
                 let offset = index * 4
