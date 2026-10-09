@@ -264,112 +264,126 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
-                    HStack {
-                        Text("Status")
-                        Spacer()
-                        Text(app.wifiStatus).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("IKOS K7").font(.headline)
+                        HStack {
+                            Text("Status")
+                            Spacer()
+                            Text(app.wifiStatus).foregroundStyle(.secondary)
+                        }
+                        HStack {
+                            Text("Device")
+                            Spacer()
+                            Text("J7 " + app.j7Host).foregroundStyle(.secondary)
+                        }
+                        Picker("SIM slot", selection: $app.simSlot) {
+                            Text("SIM 1").tag(0)
+                            Text("SIM 2").tag(1)
+                        }
+                        Button("Wi-Fi audio test") { app.wifiVoice.startStandaloneTest() }
+                        Button("Stop Wi-Fi audio test") { app.wifiVoice.stop() }
+                        Button("Refresh J7 info") { app.requestDeviceInfo() }
+                        HStack {
+                            Text("Battery")
+                            Spacer()
+                            Text(app.battery).foregroundStyle(.secondary)
+                        }
+                        HStack {
+                            Text("Firmware")
+                            Spacer()
+                            Text(app.firmware).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        HStack {
+                            Text("IMEI")
+                            Spacer()
+                            Text(app.imei).foregroundStyle(.secondary)
+                        }
                     }
-                    HStack {
-                        Text("Device")
-                        Spacer()
-                        Text("J7 " + app.j7Host).foregroundStyle(.secondary)
-                    }
-                    Picker("SIM slot", selection: $app.simSlot) {
-                        Text("SIM 1").tag(0)
-                        Text("SIM 2").tag(1)
-                    }
-                    Button("Wi-Fi audio test") { app.wifiVoice.startStandaloneTest() }
-                    Button("Stop Wi-Fi audio test") { app.wifiVoice.stop() }
-                    Button("Refresh J7 info") { app.requestDeviceInfo() }
-                    HStack {
-                        Text("Battery")
-                        Spacer()
-                        Text(app.battery).foregroundStyle(.secondary)
-                    }
-                    HStack {
-                        Text("Firmware")
-                        Spacer()
-                        Text(app.firmware).foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    HStack {
-                        Text("IMEI")
-                        Spacer()
-                        Text(app.imei).foregroundStyle(.secondary)
-                    }
-                } header: {
-                    Text("IKOS K7")
-                }
+                    .padding()
+                    .background(.thinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
 
-                Section {
-                    TextField("192.168.45.94", text: $j7HostDraft)
-                        .keyboardType(.decimalPad)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Button("Save J7 IP") {
-                        saveJ7Host()
-                    }
-                    if let error = j7HostError {
-                        Text(error)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("J7 Hotspot IP").font(.headline)
+                        TextField("192.168.45.94", text: $j7HostDraft)
+                            .keyboardType(.decimalPad)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Button("Save J7 IP") { saveJ7Host() }
+                            .buttonStyle(.borderedProminent)
+                        if let error = j7HostError {
+                            Text(error).font(.footnote).foregroundStyle(.red)
+                        }
+                        Text("Enter the J7's current hotspot IPv4 address. The setting is saved on this iPhone.")
                             .font(.footnote)
-                            .foregroundStyle(.red)
-                    }
-                    Text("Enter the J7's current hotspot IPv4 address. The setting is saved on this iPhone.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } header: {
-                    Text("J7 Hotspot IP")
-                }
-
-                Section {
-                    Toggle("Auto-start Wi-Fi", isOn: $app.autoConnect)
-                    Toggle("Resolve caller names", isOn: $app.resolveCallerNames)
-                    Toggle("Missed-call notifications", isOn: $app.missedCallNotifications)
-                    Toggle("Speaker by default", isOn: $app.speakerDefault)
-                } header: {
-                    Text("Calling")
-                }
-
-                Section {
-                    Button("Allow Contacts") { app.requestContacts() }
-                    Button("Allow Notifications") { app.notifications.requestPermission() }
-                } header: {
-                    Text("Permissions")
-                }
-
-                Section {
-                    HStack {
-                        Text("Microphone")
-                        Spacer()
-                        Text(app.voiceStatus == "CLOSED" ? "OFF — idle" : "ON — active call")
                             .foregroundStyle(.secondary)
                     }
-                    Text("Wi-Fi voice uses raw 48 kHz stereo PCM. Standalone test does not invoke CallKit; real calls start audio after CallKit activation.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } header: {
-                    Text("Audio")
-                }
+                    .padding()
+                    .background(.thinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
 
-                Section {
-                    NavigationLink("Live Log") { DiagnosticLogView() }
-                } header: {
-                    Text("Diagnostics")
-                }
-
-                Section {
-                    HStack {
-                        Text("CALLSHARE")
-                        Spacer()
-                        Text("Wi-Fi R1")
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Calling").font(.headline)
+                        Toggle("Auto-start Wi-Fi", isOn: $app.autoConnect)
+                        Toggle("Resolve caller names", isOn: $app.resolveCallerNames)
+                        Toggle("Missed-call notifications", isOn: $app.missedCallNotifications)
+                        Toggle("Speaker by default", isOn: $app.speakerDefault)
                     }
-                    Text("UDP 50005 • J7WV raw PCM")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } header: {
-                    Text("About")
+                    .padding()
+                    .background(.thinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Permissions").font(.headline)
+                        Button("Allow Contacts") { app.requestContacts() }
+                        Button("Allow Notifications") { app.notifications.requestPermission() }
+                    }
+                    .padding()
+                    .background(.thinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Audio").font(.headline)
+                        HStack {
+                            Text("Microphone")
+                            Spacer()
+                            Text(app.voiceStatus == "CLOSED" ? "OFF — idle" : "ON — active call")
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("Wi-Fi voice uses raw 48 kHz stereo PCM. Standalone test does not invoke CallKit; real calls start audio after CallKit activation.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding()
+                    .background(.thinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Diagnostics").font(.headline)
+                        NavigationLink("Live Log") { DiagnosticLogView() }
+                    }
+                    .padding()
+                    .background(.thinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("About").font(.headline)
+                        HStack {
+                            Text("CALLSHARE")
+                            Spacer()
+                            Text("Wi-Fi R1")
+                        }
+                        Text("UDP 50005 • J7WV raw PCM")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding()
+                    .background(.thinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
                 }
+                .padding()
             }
             .navigationTitle("Settings")
             .onAppear {
