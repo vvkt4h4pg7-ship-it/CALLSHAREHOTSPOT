@@ -76,18 +76,21 @@ final class AppModel: ObservableObject {
                 self?.log(status)
             }
         }
+        wifi.onJ7HostDiscovered = { [weak self] host in
+            Task { @MainActor [weak self] in
+                guard let self, self.j7Host != host else { return }
+                self.log("[WIFI AUTO] Saved discovered J7 IP: \(host)")
+                self.j7Host = host
+            }
+        }
+
         wifi.onControl = { [weak self] control, payload in
             Task { @MainActor [weak self] in
                 self?.handleWiFiControl(control, payload: payload)
             }
         }
         wifi.onAudioPCM = { [weak self] pcm, rate, channels, frames in
-            guard let self else { return }
-            // Audio is legal only after CallKit has activated the call audio session.
-            // J7 may be streaming PCM continuously, but idle/ringing audio must never
-            // reach the iPhone playback engine.
-            guard self.callStatus == "ACTIVE", self.callAudioActive else { return }
-            self.wifiVoice.receivePCM(pcm, sampleRate: rate, channels: channels, frames: frames)
+            self?.wifiVoice.receivePCM(pcm, sampleRate: rate, channels: channels, frames: frames)
         }
         wifiVoice.onStatus = { [weak self] status in
             Task { @MainActor [weak self] in

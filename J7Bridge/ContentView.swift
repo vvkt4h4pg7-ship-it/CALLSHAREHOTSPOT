@@ -389,6 +389,10 @@ struct SettingsView: View {
                     j7HostDraft = app.j7Host
                 }
             }
+            .onChange(of: app.j7Host) { newValue in
+                j7HostDraft = newValue
+                j7HostError = nil
+            }
         }
     }
 

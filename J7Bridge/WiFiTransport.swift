@@ -33,6 +33,8 @@ final class WiFiTransport {
     var onControl: ((Control, Data) -> Void)?
     var onAudioPCM: ((Data, UInt32, UInt16, UInt16) -> Void)?
     var onStatus: ((String) -> Void)?
+    /// Fires only after a valid J7 audio packet or our discovery beacon proves the peer IP.
+    var onJ7HostDiscovered: ((String) -> Void)?
 
     private let rxQueue = DispatchQueue(label: "com.callshare.wifi.rx", qos: .userInitiated)
     private let txQueue = DispatchQueue(label: "com.callshare.wifi.tx", qos: .userInitiated)
@@ -226,6 +228,10 @@ final class WiFiTransport {
             rxDatagrams += 1
             let data = Data(buffer[0..<count])
             let isAudio = count >= 4 && buffer[0] == 0x4A && buffer[1] == 0x37 && buffer[2] == 0x57 && buffer[3] == 0x56
+            if let reason = discoveryReason(for: data) {
+                let sourceHost = ipv4String(from: source.sin_addr)
+                considerDiscoveredJ7Host(sourceHost, reason: reason)
+            }
             if isAudio {
                 rxAudioDatagrams += 1
                 if rxAudioDatagrams == 1 || rxAudioDatagrams % 50 == 0 {
@@ -236,6 +242,71 @@ final class WiFiTransport {
             }
 
             handleDatagram(data)
+        }
+    }
+
+    private func discoveryReason(for data: Data) -> String? {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 4 else { return nil }
+
+        // Accept only a well-formed J7WV packet from the established native audio protocol.
+        if Array(bytes[0..<4]) == Self.audioMagic {
+            guard bytes.count >= Self.audioHeaderSize else { return nil }
+            let sampleRate = readLE32(bytes, 8)
+            let channels = readLE16(bytes, 12)
+            let format = readLE16(bytes, 14)
+            let frames = readLE16(bytes, 16)
+            let flags = readLE16(bytes, 18)
+            let expected = Self.audioHeaderSize + Int(frames) * Int(channels) * 2
+            guard sampleRate == 48_000, channels == 2, format == 1,
+                  frames == 960, (flags & 0x0001) != 0, bytes.count == expected else {
+                return nil
+            }
+            return "valid J7WV audio"
+        }
+
+        // Cold-start discovery beacon emitted by the J7 helper app.
+        if Array(bytes[0..<4]) == Self.controlMagic,
+           bytes.count >= Self.controlHeaderSize,
+           bytes[4] == Self.version,
+           bytes[5] == Control.pong.rawValue {
+            let payloadLength = Int(readLE16(bytes, 10))
+            guard payloadLength == bytes.count - Self.controlHeaderSize else { return nil }
+            let payload = Data(bytes[Self.controlHeaderSize..<bytes.count])
+            guard String(data: payload, encoding: .utf8) == "CALLSHARE_DISCOVERY_R1" else { return nil }
+            return "J7WC discovery beacon"
+        }
+        return nil
+    }
+
+    private func ipv4String(from address: in_addr) -> String {
+        let value = UInt32(bigEndian: address.s_addr)
+        return "\(UInt8((value >> 24) & 0xff)).\(UInt8((value >> 16) & 0xff)).\(UInt8((value >> 8) & 0xff)).\(UInt8(value & 0xff))"
+    }
+
+    private func isPrivateIPv4(_ host: String) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        let octets = parts.compactMap { Int($0) }
+        guard octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else { return false }
+        let a = octets[0], b = octets[1]
+        return a == 10 || (a == 192 && b == 168) || (a == 172 && (16...31).contains(b)) || (a == 169 && b == 254)
+    }
+
+    private func considerDiscoveredJ7Host(_ host: String, reason: String) {
+        guard isPrivateIPv4(host) else { return }
+        txQueue.async { [weak self] in
+            guard let self, self.started, self._j7Host != host else { return }
+            let oldHost = self._j7Host
+            self._j7Host = host
+            self.uplink?.cancel()
+            self.uplink = nil
+            self.controlUplink?.cancel()
+            self.controlUplink = nil
+            self.startUplink()
+            self.startControlUplink()
+            self.onStatus?("[WIFI AUTO] J7 IP DISCOVERED \(oldHost) -> \(host) via \(reason)")
+            self.onJ7HostDiscovered?(host)
         }
     }
 

@@ -84,7 +84,12 @@ final class CallKitManager: NSObject {
     }
 
     func fulfillAnswerIfNeeded() {
-        answerAction?.fulfill()
+        guard let action = answerAction else {
+            onLog?("[CALLKIT] CALL_ACTIVE received with no pending Answer action")
+            return
+        }
+        onLog?("[CALLKIT] ANSWER FULFILLED after J7 CALL_ACTIVE confirmation")
+        action.fulfill()
         answerAction = nil
     }
 
@@ -113,6 +118,16 @@ final class CallKitManager: NSObject {
 }
 
 extension CallKitManager: CXProviderDelegate {
+    func provider(_ provider: CXProvider, timedOutPerforming action: CXAction) {
+        if action is CXAnswerCallAction {
+            onLog?("[CALLKIT] ANSWER TIMEOUT: no J7 CALL_ACTIVE/OFFHOOK confirmation arrived")
+            // CallKit has already timed out this action; do not fulfill/fail it here.
+            answerAction = nil
+        } else {
+            onLog?("[CALLKIT] ACTION TIMEOUT type=\(type(of: action))")
+        }
+    }
+
     func providerDidReset(_ provider: CXProvider) {
         currentUUID = nil
         answerAction = nil
