@@ -54,6 +54,13 @@ final class WiFiTransport {
     private var pendingTX: [Data] = []
     private var pendingControlTX: [Data] = []
     private let maxPendingTX = 5
+
+    // R1 background resilience: recover terminal UDP uplink failures instead of
+    // leaving the audio/control path nil until the user edits the J7 address.
+    private var uplinkReconnectWorkItem: DispatchWorkItem?
+    private var controlReconnectWorkItem: DispatchWorkItem?
+    private var uplinkRetryAttempt = 0
+    private var controlRetryAttempt = 0
     private var started = false
 
     init(j7Host: String = "192.168.104.12", port: UInt16 = 50005) {
@@ -79,6 +86,13 @@ final class WiFiTransport {
         txQueue.async { [weak self] in
             guard let self else { return }
             self.started = false
+            self.uplinkReconnectWorkItem?.cancel()
+            self.uplinkReconnectWorkItem = nil
+            self.controlReconnectWorkItem?.cancel()
+            self.controlReconnectWorkItem = nil
+            self.uplinkRetryAttempt = 0
+            self.controlRetryAttempt = 0
+            self.onStatus?("[WIFI] TRANSPORT STOP requested")
             self.listener?.cancel()
             self.listener = nil
             self.uplink?.cancel()
@@ -104,6 +118,13 @@ final class WiFiTransport {
             guard let self else { return }
             guard self._j7Host != cleaned else { return }
             self._j7Host = cleaned
+            self.onStatus?("[WIFI] RECONNECT reason=J7_HOST_CHANGED host=\(cleaned)")
+            self.uplinkReconnectWorkItem?.cancel()
+            self.uplinkReconnectWorkItem = nil
+            self.controlReconnectWorkItem?.cancel()
+            self.controlReconnectWorkItem = nil
+            self.uplinkRetryAttempt = 0
+            self.controlRetryAttempt = 0
             self.uplink?.cancel()
             self.uplink = nil
             self.controlUplink?.cancel()
@@ -299,6 +320,13 @@ final class WiFiTransport {
             guard let self, self.started, self._j7Host != host else { return }
             let oldHost = self._j7Host
             self._j7Host = host
+            self.onStatus?("[WIFI] RECONNECT reason=AUTO_DISCOVERY old=\(oldHost) new=\(host)")
+            self.uplinkReconnectWorkItem?.cancel()
+            self.uplinkReconnectWorkItem = nil
+            self.controlReconnectWorkItem?.cancel()
+            self.controlReconnectWorkItem = nil
+            self.uplinkRetryAttempt = 0
+            self.controlRetryAttempt = 0
             self.uplink?.cancel()
             self.uplink = nil
             self.controlUplink?.cancel()
@@ -311,8 +339,12 @@ final class WiFiTransport {
     }
 
     private func startUplink() {
+        guard started else { return }
+        guard uplink == nil else { return }
+
+        let targetHost = _j7Host
         let connection = NWConnection(
-            host: NWEndpoint.Host(j7Host),
+            host: NWEndpoint.Host(targetHost),
             port: NWEndpoint.Port(rawValue: port)!,
             using: .udp
         )
@@ -320,22 +352,67 @@ final class WiFiTransport {
 
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            self.onStatus?("[WIFI] J7 UPLINK \(String(describing: state))")
-            if case .ready = state {
+            self.onStatus?("[WIFI] J7 UPLINK host=\(targetHost) state=\(String(describing: state))")
+            switch state {
+            case .ready:
+                self.uplinkReconnectWorkItem?.cancel()
+                self.uplinkReconnectWorkItem = nil
+                self.uplinkRetryAttempt = 0
                 self.flushPendingTX()
                 self.sendHello()
-            } else if case .failed = state {
-                connection.cancel()
-                self.uplink = nil
+            case .failed(let error):
+                self.onStatus?("[WIFI] J7 UPLINK FAILED host=\(targetHost) error=\(error.localizedDescription)")
+                // Only clear/recover the connection if this is still the current uplink.
+                if self.uplink === connection {
+                    self.uplink = nil
+                    connection.cancel()
+                    self.scheduleUplinkReconnect(reason: "failed")
+                } else {
+                    connection.cancel()
+                }
+            case .cancelled:
+                self.onStatus?("[WIFI] J7 UPLINK CANCELLED host=\(targetHost) current=\(self.uplink === connection)")
+                // Intentional host-change/stop cancels clear `uplink` first, so only
+                // an unexpected cancellation of the active connection is restarted.
+                if self.uplink === connection {
+                    self.uplink = nil
+                    self.scheduleUplinkReconnect(reason: "unexpected-cancel")
+                }
+            case .waiting(let error):
+                self.onStatus?("[WIFI] J7 UPLINK WAITING host=\(targetHost) error=\(error.localizedDescription)")
+            default:
+                break
             }
         }
 
         connection.start(queue: txQueue)
     }
 
+    private func scheduleUplinkReconnect(reason: String) {
+        guard started, uplinkReconnectWorkItem == nil else { return }
+        uplinkRetryAttempt = min(uplinkRetryAttempt + 1, 6)
+        let delay = min(5.0, 0.5 * pow(2.0, Double(uplinkRetryAttempt - 1)))
+        let attempt = uplinkRetryAttempt
+        onStatus?("[WIFI] J7 UPLINK RECONNECT SCHEDULED reason=\(reason) attempt=\(attempt) delay=\(String(format: "%.1f", delay))s")
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.uplinkReconnectWorkItem = nil
+            guard self.started, self.uplink == nil else { return }
+            self.onStatus?("[WIFI] J7 UPLINK RECONNECT NOW attempt=\(attempt)")
+            self.startUplink()
+        }
+        uplinkReconnectWorkItem = work
+        txQueue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
     private func startControlUplink() {
+        guard started else { return }
+        guard controlUplink == nil else { return }
+
+        let targetHost = _j7Host
         let connection = NWConnection(
-            host: NWEndpoint.Host(j7Host),
+            host: NWEndpoint.Host(targetHost),
             port: NWEndpoint.Port(rawValue: controlTxPort)!,
             using: .udp
         )
@@ -343,15 +420,53 @@ final class WiFiTransport {
 
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            self.onStatus?("[WIFI] CONTROL UPLINK \(String(describing: state)) port=\(self.controlTxPort)")
-            if case .ready = state {
+            self.onStatus?("[WIFI] CONTROL UPLINK host=\(targetHost) state=\(String(describing: state)) port=\(self.controlTxPort)")
+            switch state {
+            case .ready:
+                self.controlReconnectWorkItem?.cancel()
+                self.controlReconnectWorkItem = nil
+                self.controlRetryAttempt = 0
                 self.flushPendingControlTX()
-            } else if case .failed = state {
-                connection.cancel()
-                if self.controlUplink === connection { self.controlUplink = nil }
+            case .failed(let error):
+                self.onStatus?("[WIFI] CONTROL UPLINK FAILED host=\(targetHost) error=\(error.localizedDescription)")
+                if self.controlUplink === connection {
+                    self.controlUplink = nil
+                    connection.cancel()
+                    self.scheduleControlReconnect(reason: "failed")
+                } else {
+                    connection.cancel()
+                }
+            case .cancelled:
+                self.onStatus?("[WIFI] CONTROL UPLINK CANCELLED host=\(targetHost) current=\(self.controlUplink === connection)")
+                if self.controlUplink === connection {
+                    self.controlUplink = nil
+                    self.scheduleControlReconnect(reason: "unexpected-cancel")
+                }
+            case .waiting(let error):
+                self.onStatus?("[WIFI] CONTROL UPLINK WAITING host=\(targetHost) error=\(error.localizedDescription)")
+            default:
+                break
             }
         }
         connection.start(queue: txQueue)
+    }
+
+    private func scheduleControlReconnect(reason: String) {
+        guard started, controlReconnectWorkItem == nil else { return }
+        controlRetryAttempt = min(controlRetryAttempt + 1, 6)
+        let delay = min(5.0, 0.5 * pow(2.0, Double(controlRetryAttempt - 1)))
+        let attempt = controlRetryAttempt
+        onStatus?("[WIFI] CONTROL RECONNECT SCHEDULED reason=\(reason) attempt=\(attempt) delay=\(String(format: "%.1f", delay))s")
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.controlReconnectWorkItem = nil
+            guard self.started, self.controlUplink == nil else { return }
+            self.onStatus?("[WIFI] CONTROL RECONNECT NOW attempt=\(attempt)")
+            self.startControlUplink()
+        }
+        controlReconnectWorkItem = work
+        txQueue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func receiveLoop(_ connection: NWConnection) {

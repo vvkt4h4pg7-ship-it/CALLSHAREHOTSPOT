@@ -25,9 +25,9 @@ final class WiFiVoiceEngine: NSObject {
     // does not guarantee system AGC. Gain is capped and followed by a soft limiter.
     private let micHighPassAlpha: Double = 0.9856 // approximately 110 Hz at 48 kHz
     private let micTargetRMS: Double = 0.125      // about -18 dBFS
-    private let micMaxGain: Double = 18.0         // maximum boost: about +25 dB
+    private let micMaxGain: Double = 32.0         // maximum boost: about +30 dB
     private let micMinGain: Double = 0.35         // allow attenuation of loud wind/plosives
-    private let micGateRMS: Double = 0.0010       // avoid amplifying idle noise (~-60 dBFS)
+    private let micGateRMS: Double = 0.00008     // only leave near-digital-silence unboosted (~-82 dBFS)
     private let micLimiterKnee: Double = 0.72
     private let micLimiterCeiling: Double = 0.94
     private var micHPPrevX: Double = 0.0
@@ -185,6 +185,7 @@ final class WiFiVoiceEngine: NSObject {
             playbackQueue.async { [weak self] in self?.flushPreStartRX() }
             transport.sendVoiceOpen()
             report("[WIFI_AUDIO] OPEN OK mic=\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch -> 48k/2ch")
+            report("[WIFI_AUDIO] MIC UPLINK PROCESSOR R5 ACTIVE target=-18dBFS maxGain=32x gate=-82dBFS; applies before UDP TX only")
             return true
         } catch {
             isRunning = false
