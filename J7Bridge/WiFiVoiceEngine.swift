@@ -1,42 +1,64 @@
 import Foundation
 import AVFoundation
+import Darwin
 
+/// Fresh, isolated audio engine for CALLSHARE's existing J7WV wire protocol.
+///
+/// Wire contract (unchanged): 48,000 Hz, signed Int16 little-endian,
+/// interleaved stereo, 960 frames / 20 ms / 3,840 PCM bytes per packet.
+///
+/// Design notes:
+/// - CallKit remains the owner of AVAudioSession activation.
+/// - No VoiceProcessingIO is enabled in this first clean baseline, so the
+///   J7 -> iPhone playback path is not subjected to a new system voice DSP mode.
+/// - Capture is read from inputNode.outputFormat(forBus: 0), converted to
+///   mono Float32 at 48 kHz, processed once, and explicitly duplicated to L/R.
+/// - UDP protocol framing remains WiFiTransport's responsibility.
 final class WiFiVoiceEngine: NSObject {
+    private static let sampleRate: Double = 48_000
+    private static let packetFrames = 960
+    private static let packetBytes = packetFrames * 2 * MemoryLayout<Int16>.size
+
     private let audioEngine = AVAudioEngine()
     private let audioSession = AVAudioSession.sharedInstance()
     private let playerNode = AVAudioPlayerNode()
     private let transport: WiFiTransport
+    private let playbackQueue = DispatchQueue(label: "com.callshare.wifi.playback.r1", qos: .userInitiated)
+    private let stateLock = NSLock()
 
-    private let playbackQueue = DispatchQueue(label: "com.callshare.wifi.playback", qos: .userInitiated)
     private var isRunning = false
+    private var muted = false
     private var playbackConnected = false
-    private var converter: AVAudioConverter?
-    private var pcmAccumulator = Data()
+    private var useSpeaker = true
+
+    private var micConverter: AVAudioConverter?
+    private var micInputFormat: AVAudioFormat?
+    private let micTargetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: sampleRate,
+        channels: 1,
+        interleaved: false
+    )!
+
+    private var monoAccumulator: [Float] = []
     private var txFrames = 0
     private var rxFrames = 0
-    private var preStartRX: [(Data, UInt32, UInt16, UInt16)] = []
-    private let maxPreStartRX = 5 // ~100 ms at 20 ms packets
-    private var useSpeaker = true
-    private var muted = false
 
-    // iPhone microphone uplink only. The existing AVAudioSession, CallKit activation,
-    // UDP framing, and J7 -> iPhone playback path are intentionally unchanged.
-    // A per-packet leveler supplies makeup gain because .voiceChat without Voice Processing I/O
-    // does not guarantee system AGC. Gain is capped and followed by a soft limiter.
-    private let micHighPassAlpha: Double = 0.9856 // approximately 110 Hz at 48 kHz
-    private let micTargetRMS: Double = 0.125      // about -18 dBFS
-    private let micMaxGain: Double = 32.0         // maximum boost: about +30 dB
-    private let micMinGain: Double = 0.35         // allow attenuation of loud wind/plosives
-    private let micGateRMS: Double = 0.00008     // only leave near-digital-silence unboosted (~-82 dBFS)
-    private let micLimiterKnee: Double = 0.72
-    private let micLimiterCeiling: Double = 0.94
-    private var micHPPrevX: Double = 0.0
-    private var micHPPrevY: Double = 0.0
-    private var micCurrentGain: Double = 1.0
+    // Software mic processing. These are intentionally isolated from playback.
+    private let highPassAlpha: Double = 0.9896       // ~80 Hz at 48 kHz
+    private let targetRMS: Double = 0.125            // about -18 dBFS
+    private let maximumGain: Double = 32.0           // +30.1 dB ceiling
+    private let minimumGain: Double = 0.35
+    private let nearSilenceRMS: Double = 0.000025    // do not raise digital silence
+    private let limiterKnee: Double = 0.72
+    private let limiterCeiling: Double = 0.94
+    private var hpPreviousInput: Double = 0
+    private var hpPreviousOutput: Double = 0
+    private var currentMicGain: Double = 1.0
 
-    private let targetFormat = AVAudioFormat(
+    private let wireFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
-        sampleRate: 48_000,
+        sampleRate: sampleRate,
         channels: 2,
         interleaved: true
     )!
@@ -48,70 +70,314 @@ final class WiFiVoiceEngine: NSObject {
         super.init()
     }
 
+    // MARK: - Public API (kept compatible with AppModel.swift)
+
     func setSpeakerDefault(_ enabled: Bool) {
         useSpeaker = enabled
-        if isRunning { configureSession(activate: false) }
+        if runningSnapshot() {
+            configureAudioSession()
+        }
     }
 
     func setMuted(_ value: Bool) {
+        stateLock.lock()
         muted = value
-        report(value ? "[WIFI_AUDIO] MUTED" : "[WIFI_AUDIO] UNMUTED")
+        stateLock.unlock()
+        report(value ? "[WIFI_AUDIO] MIC MUTED" : "[WIFI_AUDIO] MIC UNMUTED")
     }
 
-    /// CallKit owns activation for real calls. We only prepare the session here;
-    /// this deliberately does not call setActive(true).
+    /// Called before CallKit activates its audio session. Never activates the
+    /// session itself; CXProviderDelegate.didActivate remains authoritative.
     func prepareForCallAudio() {
-        configureSession(activate: false)
-        report("[WIFI_AUDIO] SESSION PREPARED 48k stereo")
+        configureAudioSession()
+        report("[WIFI_AUDIO] FRESH_R1 SESSION PREPARED; CallKit owns activation")
     }
 
-    /// Real-call mode: CallKit's didActivate callback must have fired first.
     @discardableResult
     func start() -> Bool {
         startEngine()
     }
 
     func stop() {
-        guard isRunning || audioEngine.isRunning else { return }
-
+        stateLock.lock()
+        let wasRunning = isRunning
         isRunning = false
+        stateLock.unlock()
+
+        guard wasRunning || audioEngine.isRunning else { return }
+
         audioEngine.inputNode.removeTap(onBus: 0)
         playerNode.stop()
         playerNode.reset()
         audioEngine.stop()
-        converter = nil
-        pcmAccumulator.removeAll(keepingCapacity: true)
-        playbackQueue.async { [weak self] in self?.preStartRX.removeAll(keepingCapacity: true) }
+
+        micConverter = nil
+        micInputFormat = nil
+        monoAccumulator.removeAll(keepingCapacity: true)
+        resetMicDSP()
         transport.sendVoiceClose()
-        report("[WIFI_AUDIO] CLOSED")
+        report("[WIFI_AUDIO] FRESH_R1 CLOSED")
     }
 
     func receivePCM(_ pcm: Data, sampleRate: UInt32, channels: UInt16, frames: UInt16) {
-        guard sampleRate == 48_000, channels == 2, frames == 960, pcm.count == 3840 else {
+        guard sampleRate == 48_000,
+              channels == 2,
+              frames == UInt16(Self.packetFrames),
+              pcm.count == Self.packetBytes else {
             report("[WIFI_AUDIO] RX FORMAT DROP rate=\(sampleRate) ch=\(channels) frames=\(frames) bytes=\(pcm.count)")
             return
         }
 
         playbackQueue.async { [weak self] in
-            guard let self else { return }
-            // Hard gate: never queue or play GSM PCM before CallKit activates audio.
-            // This prevents pre-answer / idle audio leakage and stale frames after activation.
-            guard self.isRunning, self.audioEngine.isRunning else {
-                return
-            }
-            self.playPCMNow(pcm, frames: frames)
+            guard let self, self.runningSnapshot(), self.audioEngine.isRunning else { return }
+            self.playPCMNow(pcm)
         }
     }
 
-    private func playPCMNow(_ pcm: Data, frames: UInt16) {
-        guard let buffer = AVAudioPCMBuffer(
-            pcmFormat: targetFormat,
-            frameCapacity: AVAudioFrameCount(frames)
-        ) else { return }
+    // MARK: - Session / engine setup
 
-        buffer.frameLength = AVAudioFrameCount(frames)
-        let audioBuffer = buffer.mutableAudioBufferList.pointee.mBuffers
-        guard let destination = audioBuffer.mData else { return }
+    private func configureAudioSession() {
+        var options: AVAudioSession.CategoryOptions = []
+        if useSpeaker { options.insert(.defaultToSpeaker) }
+
+        do {
+            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
+            try audioSession.setPreferredSampleRate(Self.sampleRate)
+            // Request a low-latency hardware I/O cycle. The wire packet remains 20 ms.
+            try audioSession.setPreferredIOBufferDuration(0.01)
+            report("[WIFI_AUDIO] FRESH_R1 SESSION category=playAndRecord mode=voiceChat ioPref=10ms otherAudio=\(audioSession.isOtherAudioPlaying)")
+        } catch {
+            report("[WIFI_AUDIO] FRESH_R1 SESSION ERROR: \(error.localizedDescription)")
+        }
+    }
+
+    private func startEngine() -> Bool {
+        if runningSnapshot() { return true }
+
+        do {
+            if !playbackConnected {
+                audioEngine.attach(playerNode)
+                audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: wireFormat)
+                playbackConnected = true
+            }
+
+            // Preserve the existing J7 -> iPhone playback gain. No new output
+            // volume adjustment and no VoiceProcessingIO mode switch here.
+            playerNode.volume = 1.0
+            audioEngine.mainMixerNode.outputVolume = 1.0
+
+            let input = audioEngine.inputNode
+            // The tap is on the input node's OUTPUT bus: this is the microphone
+            // stream format to capture, not the node's input-bus format.
+            let captureFormat = input.outputFormat(forBus: 0)
+            guard captureFormat.sampleRate > 0, captureFormat.channelCount > 0 else {
+                throw engineError(1, "Microphone output format is unavailable")
+            }
+
+            guard let converter = AVAudioConverter(from: captureFormat, to: micTargetFormat) else {
+                throw engineError(2, "Could not create microphone-to-mono-48k converter")
+            }
+            // If the route offers more than one input channel, select channel 0
+            // explicitly instead of downmixing opposing channels into cancellation.
+            converter.channelMap = [NSNumber(value: 0)]
+
+            micInputFormat = captureFormat
+            micConverter = converter
+            monoAccumulator.removeAll(keepingCapacity: true)
+            txFrames = 0
+            rxFrames = 0
+            resetMicDSP()
+
+            input.removeTap(onBus: 0)
+            input.installTap(onBus: 0, bufferSize: 480, format: captureFormat) { [weak self] buffer, _ in
+                self?.captureMicrophone(buffer)
+            }
+
+            audioEngine.prepare()
+            try audioEngine.start()
+
+            stateLock.lock()
+            isRunning = true
+            stateLock.unlock()
+
+            playerNode.play()
+            transport.sendVoiceOpen()
+            report("[WIFI_AUDIO] FRESH_R1 OPEN OK capture=\(Int(captureFormat.sampleRate))Hz/\(captureFormat.channelCount)ch format=\(captureFormat.commonFormat.rawValue) -> monoFloat/48000 -> S16LE dual-mono 48k/2ch")
+            report("[WIFI_AUDIO] FRESH_R1 MIC TX path active; playback path unchanged; VPIO=off")
+            return true
+        } catch {
+            stateLock.lock()
+            isRunning = false
+            stateLock.unlock()
+            audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine.stop()
+            playerNode.stop()
+            micConverter = nil
+            micInputFormat = nil
+            report("[WIFI_AUDIO] FRESH_R1 START ERROR: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    // MARK: - Microphone capture / conversion / packetization
+
+    private func captureMicrophone(_ inputBuffer: AVAudioPCMBuffer) {
+        guard runningSnapshot(), !mutedSnapshot(), let converter = micConverter else { return }
+
+        let inputRate = inputBuffer.format.sampleRate
+        guard inputRate > 0 else { return }
+        let estimatedFrames = AVAudioFrameCount(ceil(Double(inputBuffer.frameLength) * Self.sampleRate / inputRate) + 64)
+        guard let converted = AVAudioPCMBuffer(pcmFormat: micTargetFormat, frameCapacity: max(estimatedFrames, 1)) else { return }
+
+        var converterError: NSError?
+        var providedInput = false
+        converter.convert(to: converted, error: &converterError) { _, status in
+            if providedInput {
+                status.pointee = .noDataNow
+                return nil
+            }
+            providedInput = true
+            status.pointee = .haveData
+            return inputBuffer
+        }
+
+        guard converterError == nil,
+              converted.frameLength > 0,
+              let channelData = converted.floatChannelData else {
+            if let converterError {
+                report("[WIFI_AUDIO] FRESH_R1 MIC CONVERT ERROR: \(converterError.localizedDescription)")
+            }
+            return
+        }
+
+        // The destination format is non-interleaved Float32 mono, therefore
+        // channel 0 has one contiguous sample per frame (stride 1).
+        let count = Int(converted.frameLength)
+        monoAccumulator.append(contentsOf: UnsafeBufferPointer(start: channelData[0], count: count))
+
+        while monoAccumulator.count >= Self.packetFrames {
+            let packetSamples = Array(monoAccumulator.prefix(Self.packetFrames))
+            monoAccumulator.removeFirst(Self.packetFrames)
+            let processed = makeWirePacket(fromMonoSamples: packetSamples)
+            txFrames += 1
+            transport.sendAudioPCM(processed.data, sampleRate: 48_000, channels: 2, frames: UInt16(Self.packetFrames))
+
+            if txFrames == 1 || txFrames % 50 == 0 {
+                report(String(format: "[WIFI_AUDIO] FRESH_R1 MIC TX #%d gain=%.2fx rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS outPeak=%.1f dBFS", txFrames, processed.gain, processed.rawRMSDBFS, processed.highPassRMSDBFS, processed.outputRMSDBFS, processed.outputPeakDBFS))
+            }
+        }
+    }
+
+    private struct ProcessedPacket {
+        let data: Data
+        let gain: Double
+        let rawRMSDBFS: Double
+        let highPassRMSDBFS: Double
+        let outputRMSDBFS: Double
+        let outputPeakDBFS: Double
+    }
+
+    /// Process 20 ms mono input and make exactly 3,840 bytes of L=R S16_LE PCM.
+    /// This is software mic processing only; no player/output samples are touched.
+    private func makeWirePacket(fromMonoSamples samples: [Float]) -> ProcessedPacket {
+        var filtered = [Double](repeating: 0, count: samples.count)
+        var rawSumSquares = 0.0
+        var hpSumSquares = 0.0
+        var previousX = hpPreviousInput
+        var previousY = hpPreviousOutput
+
+        for index in samples.indices {
+            let x = max(-1.0, min(1.0, Double(samples[index])))
+            rawSumSquares += x * x
+            let y = highPassAlpha * (previousY + x - previousX)
+            previousX = x
+            previousY = y
+            filtered[index] = y
+            hpSumSquares += y * y
+        }
+        hpPreviousInput = previousX
+        hpPreviousOutput = previousY
+
+        let divisor = Double(max(samples.count, 1))
+        let rawRMS = sqrt(rawSumSquares / divisor)
+        let highPassRMS = sqrt(hpSumSquares / divisor)
+
+        let desiredGain: Double
+        if highPassRMS < nearSilenceRMS {
+            desiredGain = 1.0
+        } else {
+            desiredGain = min(maximumGain, max(minimumGain, targetRMS / max(highPassRMS, 1.0e-8)))
+        }
+
+        // Fast gain reduction prevents strong plosives/wind from carrying high
+        // gain into the next speech packet; gain-up is smoothed to reduce pumping.
+        let smoothing = desiredGain < currentMicGain ? 0.82 : 0.42
+        currentMicGain += (desiredGain - currentMicGain) * smoothing
+        currentMicGain = min(maximumGain, max(minimumGain, currentMicGain))
+
+        var outputData = Data(count: Self.packetBytes)
+        var outputSumSquares = 0.0
+        var outputPeak = 0.0
+
+        outputData.withUnsafeMutableBytes { rawBuffer in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            guard bytes.count >= Self.packetBytes else { return }
+
+            for index in 0..<Self.packetFrames {
+                let boosted = filtered[index] * currentMicGain
+                let magnitude = abs(boosted)
+                let limitedMagnitude: Double
+                if magnitude <= limiterKnee {
+                    limitedMagnitude = magnitude
+                } else {
+                    let span = limiterCeiling - limiterKnee
+                    limitedMagnitude = limiterKnee + span * (1.0 - exp(-(magnitude - limiterKnee) / span))
+                }
+                let limited = boosted < 0 ? -limitedMagnitude : limitedMagnitude
+                let normalized = max(-1.0, min(32767.0 / 32768.0, limited))
+                let quantized = Int16((normalized * 32768.0).rounded())
+                let bits = UInt16(bitPattern: quantized)
+                let offset = index * 4
+
+                // Explicit little-endian dual mono: L sample then identical R sample.
+                let lo = UInt8(truncatingIfNeeded: bits)
+                let hi = UInt8(truncatingIfNeeded: bits >> 8)
+                bytes[offset] = lo
+                bytes[offset + 1] = hi
+                bytes[offset + 2] = lo
+                bytes[offset + 3] = hi
+
+                let sampleOut = Double(quantized) / 32768.0
+                outputSumSquares += sampleOut * sampleOut
+                outputPeak = max(outputPeak, abs(sampleOut))
+            }
+        }
+
+        return ProcessedPacket(
+            data: outputData,
+            gain: currentMicGain,
+            rawRMSDBFS: dbfs(sqrt(rawSumSquares / divisor)),
+            highPassRMSDBFS: dbfs(highPassRMS),
+            outputRMSDBFS: dbfs(sqrt(outputSumSquares / divisor)),
+            outputPeakDBFS: dbfs(outputPeak)
+        )
+    }
+
+    private func resetMicDSP() {
+        hpPreviousInput = 0
+        hpPreviousOutput = 0
+        currentMicGain = 1.0
+    }
+
+    // MARK: - J7 -> iPhone playback (wire-compatible path kept intentionally simple)
+
+    private func playPCMNow(_ pcm: Data) {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: wireFormat, frameCapacity: AVAudioFrameCount(Self.packetFrames)) else { return }
+        buffer.frameLength = AVAudioFrameCount(Self.packetFrames)
+
+        let audioBufferList = buffer.mutableAudioBufferList
+        guard audioBufferList.pointee.mNumberBuffers == 1,
+              let destination = audioBufferList.pointee.mBuffers.mData else { return }
 
         pcm.withUnsafeBytes { source in
             guard let base = source.baseAddress else { return }
@@ -120,294 +386,39 @@ final class WiFiVoiceEngine: NSObject {
 
         playerNode.scheduleBuffer(buffer)
         rxFrames += 1
-
         if rxFrames == 1 || rxFrames % 50 == 0 {
-            report("[WIFI_AUDIO] RX PCM #\(rxFrames) 3840B")
+            report("[WIFI_AUDIO] FRESH_R1 RX PCM #\(rxFrames) 3840B")
         }
-
-        if !playerNode.isPlaying {
-            playerNode.play()
-        }
+        if !playerNode.isPlaying { playerNode.play() }
     }
 
-    private func flushPreStartRX() {
-        let pending = preStartRX
-        preStartRX.removeAll(keepingCapacity: true)
-        for (pcm, _, _, frames) in pending {
-            playPCMNow(pcm, frames: frames)
-        }
+    // MARK: - Small helpers
+
+    private func runningSnapshot() -> Bool {
+        stateLock.lock()
+        let value = isRunning
+        stateLock.unlock()
+        return value
     }
 
-    private func startEngine() -> Bool {
-        guard !isRunning else { return true }
-
-        do {
-            if !playbackConnected {
-                audioEngine.attach(playerNode)
-                audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: targetFormat)
-                playbackConnected = true
-            }
-
-            playerNode.volume = 1.0
-            audioEngine.mainMixerNode.outputVolume = 1.0
-
-            let input = audioEngine.inputNode
-            let inputFormat = input.inputFormat(forBus: 0)
-            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-                throw NSError(domain: "CALLSHARE.WiFiAudio", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "No microphone input route"])
-            }
-
-            converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-            guard converter != nil else {
-                throw NSError(domain: "CALLSHARE.WiFiAudio", code: 2,
-                              userInfo: [NSLocalizedDescriptionKey: "48 kHz stereo converter unavailable"])
-            }
-
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 960, format: inputFormat) { [weak self] buffer, _ in
-                self?.capture(buffer)
-            }
-
-            playerNode.stop()
-            playerNode.reset()
-            txFrames = 0
-            rxFrames = 0
-            pcmAccumulator.removeAll(keepingCapacity: true)
-            micHPPrevX = 0.0
-            micHPPrevY = 0.0
-            micCurrentGain = 1.0
-
-            audioEngine.prepare()
-            try audioEngine.start()
-            isRunning = true
-            playerNode.play()
-            playbackQueue.async { [weak self] in self?.flushPreStartRX() }
-            transport.sendVoiceOpen()
-            report("[WIFI_AUDIO] OPEN OK mic=\(Int(inputFormat.sampleRate))Hz/\(inputFormat.channelCount)ch -> 48k/2ch")
-            report("[WIFI_AUDIO] MIC UPLINK PROCESSOR R5 ACTIVE target=-18dBFS maxGain=32x gate=-82dBFS; applies before UDP TX only")
-            return true
-        } catch {
-            isRunning = false
-            inputRemoveTapSafely()
-            audioEngine.stop()
-            playerNode.stop()
-            converter = nil
-            report("[WIFI_AUDIO] START ERROR: \(error.localizedDescription)")
-            return false
-        }
+    private func mutedSnapshot() -> Bool {
+        stateLock.lock()
+        let value = muted
+        stateLock.unlock()
+        return value
     }
 
-    private func capture(_ buffer: AVAudioPCMBuffer) {
-        guard isRunning, let converter, !muted else { return }
-
-        let estimated = AVAudioFrameCount(Double(buffer.frameLength) *
-                                          targetFormat.sampleRate / buffer.format.sampleRate + 64)
-        guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: estimated) else { return }
-
-        var error: NSError?
-        var supplied = false
-        converter.convert(to: converted, error: &error) { _, status in
-            if supplied {
-                status.pointee = .noDataNow
-                return nil
-            }
-            supplied = true
-            status.pointee = .haveData
-            return buffer
-        }
-
-        guard error == nil,
-              converted.frameLength > 0,
-              let raw = interleavedPCMData(from: converted) else {
-            if let error { report("[WIFI_AUDIO] MIC CONVERT ERROR: \(error.localizedDescription)") }
-            return
-        }
-
-        pcmAccumulator.append(raw)
-        let frameBytes = 960 * 2 * 2
-
-        while pcmAccumulator.count >= frameBytes {
-            let frame = Data(pcmAccumulator.prefix(frameBytes))
-            pcmAccumulator.removeFirst(frameBytes)
-
-            // Process the final 20 ms packet in its known format: interleaved S16_LE stereo.
-            // This avoids int16ChannelData indexing against an interleaved AVAudioBuffer.
-            let processed = applyMicSpeechLeveler(frame)
-            txFrames += 1
-            transport.sendAudioPCM(processed.data)
-
-            if txFrames == 1 || txFrames % 50 == 0 {
-                report(String(format: "[WIFI_AUDIO] MIC LEVELER TX #%d gain=%.2fx rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS rawPeak=%.1f dBFS outPeak=%.1f dBFS",
-                              txFrames, processed.gain, processed.inputRMSDBFS, processed.filteredRMSDBFS,
-                              processed.outputRMSDBFS, processed.inputPeakDBFS, processed.outputPeakDBFS))
-            }
-        }
+    private func dbfs(_ value: Double) -> Double {
+        guard value > 0 else { return -120.0 }
+        return 20.0 * log10(value)
     }
 
-    private struct MicPCMResult {
-        let data: Data
-        let inputRMSDBFS: Double
-        let filteredRMSDBFS: Double
-        let outputRMSDBFS: Double
-        let inputPeakDBFS: Double
-        let outputPeakDBFS: Double
-        let gain: Double
-    }
-
-    /// Processes ONLY iPhone microphone uplink PCM, after conversion and before UDP TX.
-    /// Input packet is 20 ms, 48 kHz, interleaved S16_LE stereo (L,R,L,R...).
-    /// The active route has previously reported a mono mic input, so use the converted
-    /// left sample as the mono source and explicitly write it to both output channels.
-    /// A high-pass attenuates wind/handling rumble; a smoothed RMS leveler lifts ordinary speech;
-    /// a soft limiter controls strong peaks. No playback code is touched.
-    private func applyMicSpeechLeveler(_ pcm: Data) -> MicPCMResult {
-        var output = pcm
-        var inputSumSquares = 0.0
-        var filteredSumSquares = 0.0
-        var inputPeak = 0.0
-        let frameCount = pcm.count / 4 // two Int16 samples per stereo frame
-        var metrics = (-120.0, -120.0, -120.0, -120.0, -120.0, 1.0)
-        let startHPX = micHPPrevX
-        let startHPY = micHPPrevY
-
-        output.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
-            let bytes = raw.bindMemory(to: UInt8.self)
-            guard frameCount > 0, bytes.count >= frameCount * 4 else { return }
-
-            // Pass 1: inspect original left-channel PCM and measure the level. No per-packet
-            // sample-array allocation is needed on the real-time audio callback.
-            var hpX = startHPX
-            var hpY = startHPY
-            for frame in 0..<frameCount {
-                let offset = frame * 4
-                let bits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
-                let sample = Int16(bitPattern: bits)
-                let x = Double(sample) / 32768.0
-                inputSumSquares += x * x
-                inputPeak = max(inputPeak, abs(x))
-
-                let y = micHighPassAlpha * (hpY + x - hpX)
-                hpX = x
-                hpY = y
-                filteredSumSquares += y * y
-            }
-            micHPPrevX = hpX
-            micHPPrevY = hpY
-
-            let divisor = Double(max(frameCount, 1))
-            let inputRMS = sqrt(inputSumSquares / divisor)
-            let filteredRMS = sqrt(filteredSumSquares / divisor)
-
-            // Target about -18 dBFS. Unlike fixed makeup gain, this can attenuate loud gusts
-            // as well as raise speech, while still limiting maximum boost to 18x.
-            let desiredGain: Double
-            if filteredRMS < micGateRMS {
-                desiredGain = 1.0
-            } else {
-                desiredGain = min(micMaxGain, max(micMinGain, micTargetRMS / max(filteredRMS, 1.0e-6)))
-            }
-
-            // Quiet speech gets fast-but-smoothed gain-up. Loud transients trigger near-immediate
-            // gain reduction so a close breath cannot inherit several packets of high speech gain.
-            let smoothing: Double
-            if filteredRMS < micGateRMS {
-                smoothing = 0.85
-            } else if desiredGain > micCurrentGain {
-                smoothing = 0.38
-            } else {
-                smoothing = 0.92
-            }
-            micCurrentGain += (desiredGain - micCurrentGain) * smoothing
-            micCurrentGain = min(micMaxGain, max(micMinGain, micCurrentGain))
-
-            // Pass 2: apply the same high-pass from the packet's original filter state, gain,
-            // limiter, and dual-mono mapping. Both channels are written identically.
-            hpX = startHPX
-            hpY = startHPY
-            var outputSumSquares = 0.0
-            var outputPeak = 0.0
-            for frame in 0..<frameCount {
-                let offset = frame * 4
-                let inBits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
-                let inputSample = Int16(bitPattern: inBits)
-                let x = Double(inputSample) / 32768.0
-                let filtered = micHighPassAlpha * (hpY + x - hpX)
-                hpX = x
-                hpY = filtered
-
-                let boosted = filtered * micCurrentGain
-                let magnitude = abs(boosted)
-                let limitedMagnitude: Double
-                if magnitude <= micLimiterKnee {
-                    limitedMagnitude = magnitude
-                } else {
-                    let span = micLimiterCeiling - micLimiterKnee
-                    let excess = magnitude - micLimiterKnee
-                    limitedMagnitude = micLimiterKnee + span * (1.0 - exp(-excess / span))
-                }
-                let limited = boosted < 0.0 ? -limitedMagnitude : limitedMagnitude
-                let bounded = Int32(max(-32768.0, min(32767.0, (limited * 32768.0).rounded())))
-                let result = Int16(bounded)
-                let outBits = UInt16(bitPattern: result)
-
-                bytes[offset] = UInt8(truncatingIfNeeded: outBits)
-                bytes[offset + 1] = UInt8(truncatingIfNeeded: outBits >> 8)
-                bytes[offset + 2] = UInt8(truncatingIfNeeded: outBits)
-                bytes[offset + 3] = UInt8(truncatingIfNeeded: outBits >> 8)
-
-                let normalized = Double(result) / 32768.0
-                outputSumSquares += normalized * normalized
-                outputPeak = max(outputPeak, abs(normalized))
-            }
-
-            let outputRMS = sqrt(outputSumSquares / divisor)
-            metrics = (
-                levelDBFS(inputRMS), levelDBFS(filteredRMS), levelDBFS(outputRMS),
-                levelDBFS(inputPeak), levelDBFS(outputPeak), micCurrentGain
-            )
-        }
-
-        return MicPCMResult(data: output, inputRMSDBFS: metrics.0, filteredRMSDBFS: metrics.1,
-                            outputRMSDBFS: metrics.2, inputPeakDBFS: metrics.3,
-                            outputPeakDBFS: metrics.4, gain: metrics.5)
-    }
-
-    private func levelDBFS(_ normalizedLevel: Double) -> Double {
-        guard normalizedLevel > 0 else { return -120.0 }
-        return 20.0 * log10(normalizedLevel)
-    }
-
-    private func interleavedPCMData(from buffer: AVAudioPCMBuffer) -> Data? {
-        let list = buffer.audioBufferList.pointee
-        guard let mData = list.mBuffers.mData else { return nil }
-        let byteCount = Int(buffer.frameLength) * Int(targetFormat.channelCount) * MemoryLayout<Int16>.size
-        return Data(bytes: mData, count: byteCount)
-    }
-
-    private func configureSession(activate: Bool) {
-        var options: AVAudioSession.CategoryOptions = [.defaultToSpeaker]
-        if !useSpeaker { options.remove(.defaultToSpeaker) }
-
-        do {
-            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
-            try audioSession.setPreferredSampleRate(48_000)
-            try audioSession.setPreferredIOBufferDuration(0.02)
-            if activate {
-                try audioSession.setActive(true)
-            }
-        } catch {
-            report("[WIFI_AUDIO] SESSION ERROR: \(error.localizedDescription)")
-        }
-    }
-
-    private func inputRemoveTapSafely() {
-        audioEngine.inputNode.removeTap(onBus: 0)
+    private func engineError(_ code: Int, _ message: String) -> NSError {
+        NSError(domain: "CALLSHARE.WiFiVoiceEngine.FRESH_R1", code: code,
+                userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     private func report(_ status: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.onStatus?(status)
-        }
+        DispatchQueue.main.async { [weak self] in self?.onStatus?(status) }
     }
 }
