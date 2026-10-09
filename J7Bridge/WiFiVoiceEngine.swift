@@ -19,16 +19,9 @@ final class WiFiVoiceEngine: NSObject {
     private var useSpeaker = true
     private var muted = false
 
-    // iPhone microphone uplink processing only (iPhone -> J7 -> GSM).
-    // VPIO provides Apple's speech-oriented processing/automatic gain correction.
-    // A moderate software makeup gain follows it; a high-pass filter attenuates wind rumble.
-    private let micPreGain: Double = 3.0
-    private let micHighPassAlpha: Double = 0.98958 // 1-pole high-pass, ~80 Hz at 48 kHz
-    private let micLimiterKnee: Double = 0.72
-    private let micLimiterCeiling: Double = 0.93
-    // Filter state is retained across 20 ms UDP packets to avoid packet-edge clicks.
-    private var micHPPrevX: [Double] = [0.0, 0.0]
-    private var micHPPrevY: [Double] = [0.0, 0.0]
+    // Outgoing iPhone microphone -> J7 -> GSM gain. Applied after conversion to
+    // interleaved S16_LE stereo, just before UDP transmission. No playback-path changes.
+    private let micPreGain: Double = 5.0
 
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
@@ -147,23 +140,7 @@ final class WiFiVoiceEngine: NSObject {
             playerNode.volume = 1.0
             audioEngine.mainMixerNode.outputVolume = 1.0
 
-            // .voiceChat alone does not guarantee Voice Processing I/O (VPIO).
-            // Enable it explicitly before querying the microphone format / installing the tap.
-            // If iOS refuses this on a particular route, keep the current engine path alive
-            // and record the failure rather than breaking CallKit audio entirely.
             let input = audioEngine.inputNode
-            do {
-                try input.setVoiceProcessingEnabled(true)
-            } catch {
-                report("[WIFI_AUDIO] VPIO INPUT ENABLE ERROR: \(error.localizedDescription)")
-            }
-            do {
-                try audioEngine.outputNode.setVoiceProcessingEnabled(true)
-            } catch {
-                report("[WIFI_AUDIO] VPIO OUTPUT ENABLE ERROR: \(error.localizedDescription)")
-            }
-            report("[WIFI_AUDIO] VPIO status input=\(input.isVoiceProcessingEnabled) output=\(audioEngine.outputNode.isVoiceProcessingEnabled)")
-
             let inputFormat = input.inputFormat(forBus: 0)
             guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
                 throw NSError(domain: "CALLSHARE.WiFiAudio", code: 1,
@@ -186,8 +163,6 @@ final class WiFiVoiceEngine: NSObject {
             txFrames = 0
             rxFrames = 0
             pcmAccumulator.removeAll(keepingCapacity: true)
-            micHPPrevX = [0.0, 0.0]
-            micHPPrevY = [0.0, 0.0]
 
             audioEngine.prepare()
             try audioEngine.start()
@@ -263,9 +238,8 @@ final class WiFiVoiceEngine: NSObject {
         let postPeakDBFS: Double
     }
 
-    /// Speech-oriented uplink processing for one 20 ms S16_LE interleaved stereo packet.
-    /// 1) attenuate sub-voice wind/handling rumble; 2) apply makeup gain; 3) soft-limit peaks.
-    /// Apple's Voice Processing I/O (when successfully enabled) runs upstream of this stage.
+    /// Applies 5x gain with tanh soft-clipping to one 20 ms S16_LE interleaved stereo packet.
+    /// This is only the iPhone microphone uplink; J7 -> iPhone playback is untouched.
     private func applyMicGainAndSoftClip(_ pcm: Data, preGain: Double) -> MicPCMResult {
         var output = pcm
         var preSumSquares = 0.0
@@ -279,9 +253,9 @@ final class WiFiVoiceEngine: NSObject {
             sampleCount = bytes.count / MemoryLayout<Int16>.size
             guard sampleCount > 0 else { return }
 
-            // targetFormat is S16_LE, interleaved stereo: L,R,L,R,...
             for sampleIndex in 0..<sampleCount {
                 let offset = sampleIndex * 2
+                // The target PCM is S16_LE. Read/write explicitly so no alignment assumptions are made.
                 let bits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
                 let sample = Int16(bitPattern: bits)
                 let normalized = Double(sample) / 32768.0
@@ -289,26 +263,9 @@ final class WiFiVoiceEngine: NSObject {
                 preSumSquares += normalized * normalized
                 prePeak = max(prePeak, abs(normalized))
 
-                let channel = sampleIndex & 1
-                // First-order high-pass, with state across packets, to reduce low-frequency wind rumble.
-                let filtered = micHighPassAlpha * (micHPPrevY[channel] + normalized - micHPPrevX[channel])
-                micHPPrevX[channel] = normalized
-                micHPPrevY[channel] = filtered
-
-                let boosted = filtered * preGain
-                let magnitude = abs(boosted)
-                let processedMagnitude: Double
-                if magnitude <= micLimiterKnee {
-                    // Keep normal speech linear below the limiter knee.
-                    processedMagnitude = magnitude
-                } else {
-                    // Smoothly approach a ceiling without the always-on distortion of tanh(x * gain).
-                    let span = micLimiterCeiling - micLimiterKnee
-                    let excess = magnitude - micLimiterKnee
-                    processedMagnitude = micLimiterKnee + span * (1.0 - exp(-excess / span))
-                }
-                let limited = (boosted < 0.0 ? -processedMagnitude : processedMagnitude)
-                let rounded = (limited * 32768.0).rounded()
+                // At low levels this approaches linear 5x gain; louder peaks are smoothly limited.
+                let shaped = tanh(normalized * preGain)
+                let rounded = (shaped * 32768.0).rounded()
                 let bounded = Int32(max(-32768.0, min(32767.0, rounded)))
                 let processedSample = Int16(bounded)
                 let outBits = UInt16(bitPattern: processedSample)
