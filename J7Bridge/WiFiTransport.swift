@@ -24,12 +24,14 @@ final class WiFiTransport {
     private static let version: UInt8 = 1
     private static let controlHeaderSize = 12
     private static let audioHeaderSize = 20
-    // MTU-safe J7WV R2: three 320-frame fragments reconstruct one 960-frame block.
+    // R2 wire format must match j7_wifi_voice_core_R2_FRAGMENTED_TEST:
+    // bit 0 = audio, bit 1 = fragmented, bits 8-9 = fragment index.
+    // All three fragments for a 20 ms PCM block share one sequence number.
     private static let audioFragmentFrames: UInt16 = 320
     private static let audioFragmentCount = 3
-    private static let audioFragmentFlag: UInt16 = 0x0008
-    private static let audioFragmentIndexShift: UInt16 = 4
-    private static let audioFragmentIndexMask: UInt16 = 0x0030
+    private static let audioFragmentFlag: UInt16 = 0x0002
+    private static let audioFragmentIndexShift: UInt16 = 8
+    private static let audioFragmentIndexMask: UInt16 = 0x0300
     private static let audioFragmentPCMBytes = 320 * 2 * MemoryLayout<Int16>.size
     private static let audioFullPCMBytes = 960 * 2 * MemoryLayout<Int16>.size
 
@@ -57,9 +59,9 @@ final class WiFiTransport {
     private var rxDatagrams: UInt64 = 0
     private var rxAudioDatagrams: UInt64 = 0
     private var rxAudioFrames: UInt64 = 0
-    private var fragmentAssembly = Data(repeating: 0, count: Self.audioFullPCMBytes)
-    private var fragmentAssemblyBaseSequence: UInt32?
-    private var fragmentAssemblyMask: UInt8 = 0
+    // Keep a small bounded reassembly window to tolerate out-of-order UDP fragments.
+    private var rxFragmentParts: [UInt32: [Int: Data]] = [:]
+    private var rxFragmentOrder: [UInt32] = []
     private var txAudioFrames: UInt64 = 0
     private var sequence: UInt32 = 0
     private var pendingTX: [Data] = []
@@ -104,9 +106,8 @@ final class WiFiTransport {
             self.rxDatagrams = 0
             self.rxAudioDatagrams = 0
             self.rxAudioFrames = 0
-            self.fragmentAssemblyBaseSequence = nil
-            self.fragmentAssemblyMask = 0
-            self.fragmentAssembly = Data(repeating: 0, count: Self.audioFullPCMBytes)
+            self.rxFragmentParts.removeAll(keepingCapacity: false)
+            self.rxFragmentOrder.removeAll(keepingCapacity: false)
             self.txAudioFrames = 0
             self.pendingTX.removeAll(keepingCapacity: false)
             self.pendingControlTX.removeAll(keepingCapacity: false)
@@ -172,6 +173,7 @@ final class WiFiTransport {
                 // Preserve the 20 ms capture/PCM block but send three 6.67 ms UDP
                 // datagrams, each <= 1300 bytes including the 20-byte J7WV header.
                 let partBytes = Self.audioFragmentPCMBytes
+                let frameSequence = self.nextSequence()
                 for fragmentIndex in 0..<Self.audioFragmentCount {
                     let start = fragmentIndex * partBytes
                     let piece = pcm.subdata(in: start..<(start + partBytes))
@@ -182,7 +184,8 @@ final class WiFiTransport {
                         sampleRate: sampleRate,
                         channels: channels,
                         frames: Self.audioFragmentFrames,
-                        flags: flags
+                        flags: flags,
+                        sequence: frameSequence
                     )
                     self.enqueueOrSend(packet)
                 }
@@ -424,24 +427,30 @@ final class WiFiTransport {
                 return
             }
 
-            // Three consecutive sequence values form one block. Control packets
-            // share the global sequence space but are queued between audio blocks,
-            // never between a block's three fragments.
-            let baseSequence = sequence &- UInt32(fragmentIndex)
-            if fragmentAssemblyBaseSequence != baseSequence {
-                fragmentAssembly = Data(repeating: 0, count: Self.audioFullPCMBytes)
-                fragmentAssemblyBaseSequence = baseSequence
-                fragmentAssemblyMask = 0
+            // The Android R2 sender uses one shared sequence for all three parts.
+            // Keep a bounded window so fragments can arrive out of order safely.
+            if rxFragmentParts[sequence] == nil {
+                rxFragmentParts[sequence] = [:]
+                rxFragmentOrder.append(sequence)
             }
-            let start = fragmentIndex * Self.audioFragmentPCMBytes
-            fragmentAssembly.replaceSubrange(start..<(start + payload.count), with: payload)
-            fragmentAssemblyMask |= UInt8(1 << fragmentIndex)
+            rxFragmentParts[sequence]?[fragmentIndex] = payload
 
-            guard fragmentAssemblyMask == UInt8((1 << Self.audioFragmentCount) - 1) else { return }
+            while rxFragmentOrder.count > 8 {
+                let staleSequence = rxFragmentOrder.removeFirst()
+                rxFragmentParts.removeValue(forKey: staleSequence)
+            }
 
-            let completePCM = fragmentAssembly
-            fragmentAssemblyBaseSequence = nil
-            fragmentAssemblyMask = 0
+            guard let parts = rxFragmentParts[sequence], parts.count == Self.audioFragmentCount else { return }
+            var completePCM = Data()
+            completePCM.reserveCapacity(Self.audioFullPCMBytes)
+            for partIndex in 0..<Self.audioFragmentCount {
+                guard let part = parts[partIndex], part.count == Self.audioFragmentPCMBytes else { return }
+                completePCM.append(part)
+            }
+            guard completePCM.count == Self.audioFullPCMBytes else { return }
+
+            rxFragmentParts.removeValue(forKey: sequence)
+            rxFragmentOrder.removeAll { $0 == sequence }
             rxAudioFrames &+= 1
             if rxAudioFrames == 1 || rxAudioFrames % 50 == 0 {
                 onStatus?("[WIFI_AUDIO] R2 RX frame #\(rxAudioFrames): reassembled 3x1280B -> 3840B")
@@ -521,8 +530,11 @@ final class WiFiTransport {
         return out
     }
 
-    private func makeAudioPacket(pcm: Data, sampleRate: UInt32, channels: UInt16, frames: UInt16, flags: UInt16) -> Data {
-        let seq = nextSequence()
+    private func makeAudioPacket(
+        pcm: Data, sampleRate: UInt32, channels: UInt16, frames: UInt16,
+        flags: UInt16, sequence: UInt32? = nil
+    ) -> Data {
+        let seq = sequence ?? nextSequence()
         var out = Data(Self.audioMagic)
         appendLE32(&out, seq)
         appendLE32(&out, sampleRate)
