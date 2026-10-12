@@ -24,6 +24,14 @@ final class WiFiTransport {
     private static let version: UInt8 = 1
     private static let controlHeaderSize = 12
     private static let audioHeaderSize = 20
+    // MTU-safe J7WV R2: three 320-frame fragments reconstruct one 960-frame block.
+    private static let audioFragmentFrames: UInt16 = 320
+    private static let audioFragmentCount = 3
+    private static let audioFragmentFlag: UInt16 = 0x0008
+    private static let audioFragmentIndexShift: UInt16 = 4
+    private static let audioFragmentIndexMask: UInt16 = 0x0030
+    private static let audioFragmentPCMBytes = 320 * 2 * MemoryLayout<Int16>.size
+    private static let audioFullPCMBytes = 960 * 2 * MemoryLayout<Int16>.size
 
     private var _j7Host: String
     let port: UInt16
@@ -33,8 +41,6 @@ final class WiFiTransport {
     var onControl: ((Control, Data) -> Void)?
     var onAudioPCM: ((Data, UInt32, UInt16, UInt16) -> Void)?
     var onStatus: ((String) -> Void)?
-    /// Fires only after a valid J7 audio packet or our discovery beacon proves the peer IP.
-    var onJ7HostDiscovered: ((String) -> Void)?
 
     private let rxQueue = DispatchQueue(label: "com.callshare.wifi.rx", qos: .userInitiated)
     private let txQueue = DispatchQueue(label: "com.callshare.wifi.tx", qos: .userInitiated)
@@ -50,17 +56,15 @@ final class WiFiTransport {
     private var rxSocket: Int32 = -1
     private var rxDatagrams: UInt64 = 0
     private var rxAudioDatagrams: UInt64 = 0
+    private var rxAudioFrames: UInt64 = 0
+    private var fragmentAssembly = Data(repeating: 0, count: Self.audioFullPCMBytes)
+    private var fragmentAssemblyBaseSequence: UInt32?
+    private var fragmentAssemblyMask: UInt8 = 0
+    private var txAudioFrames: UInt64 = 0
     private var sequence: UInt32 = 0
     private var pendingTX: [Data] = []
     private var pendingControlTX: [Data] = []
-    private let maxPendingTX = 5
-
-    // R1 background resilience: recover terminal UDP uplink failures instead of
-    // leaving the audio/control path nil until the user edits the J7 address.
-    private var uplinkReconnectWorkItem: DispatchWorkItem?
-    private var controlReconnectWorkItem: DispatchWorkItem?
-    private var uplinkRetryAttempt = 0
-    private var controlRetryAttempt = 0
+    private let maxPendingTX = 15 // 5 logical 20 ms PCM blocks at 3 datagrams/block
     private var started = false
 
     init(j7Host: String = "192.168.104.12", port: UInt16 = 50005) {
@@ -86,13 +90,6 @@ final class WiFiTransport {
         txQueue.async { [weak self] in
             guard let self else { return }
             self.started = false
-            self.uplinkReconnectWorkItem?.cancel()
-            self.uplinkReconnectWorkItem = nil
-            self.controlReconnectWorkItem?.cancel()
-            self.controlReconnectWorkItem = nil
-            self.uplinkRetryAttempt = 0
-            self.controlRetryAttempt = 0
-            self.onStatus?("[WIFI] TRANSPORT STOP requested")
             self.listener?.cancel()
             self.listener = nil
             self.uplink?.cancel()
@@ -106,6 +103,11 @@ final class WiFiTransport {
             }
             self.rxDatagrams = 0
             self.rxAudioDatagrams = 0
+            self.rxAudioFrames = 0
+            self.fragmentAssemblyBaseSequence = nil
+            self.fragmentAssemblyMask = 0
+            self.fragmentAssembly = Data(repeating: 0, count: Self.audioFullPCMBytes)
+            self.txAudioFrames = 0
             self.pendingTX.removeAll(keepingCapacity: false)
             self.pendingControlTX.removeAll(keepingCapacity: false)
         }
@@ -118,13 +120,6 @@ final class WiFiTransport {
             guard let self else { return }
             guard self._j7Host != cleaned else { return }
             self._j7Host = cleaned
-            self.onStatus?("[WIFI] RECONNECT reason=J7_HOST_CHANGED host=\(cleaned)")
-            self.uplinkReconnectWorkItem?.cancel()
-            self.uplinkReconnectWorkItem = nil
-            self.controlReconnectWorkItem?.cancel()
-            self.controlReconnectWorkItem = nil
-            self.uplinkRetryAttempt = 0
-            self.controlRetryAttempt = 0
             self.uplink?.cancel()
             self.uplink = nil
             self.controlUplink?.cancel()
@@ -173,13 +168,39 @@ final class WiFiTransport {
 
         txQueue.async { [weak self] in
             guard let self else { return }
-            let packet = self.makeAudioPacket(
-                pcm: pcm,
-                sampleRate: sampleRate,
-                channels: channels,
-                frames: frames
-            )
-            self.enqueueOrSend(packet)
+            if sampleRate == 48_000 && channels == 2 && frames == 960 && pcm.count == Self.audioFullPCMBytes {
+                // Preserve the 20 ms capture/PCM block but send three 6.67 ms UDP
+                // datagrams, each <= 1300 bytes including the 20-byte J7WV header.
+                let partBytes = Self.audioFragmentPCMBytes
+                for fragmentIndex in 0..<Self.audioFragmentCount {
+                    let start = fragmentIndex * partBytes
+                    let piece = pcm.subdata(in: start..<(start + partBytes))
+                    let flags = UInt16(0x0001) | Self.audioFragmentFlag |
+                        (UInt16(fragmentIndex) << Self.audioFragmentIndexShift)
+                    let packet = self.makeAudioPacket(
+                        pcm: piece,
+                        sampleRate: sampleRate,
+                        channels: channels,
+                        frames: Self.audioFragmentFrames,
+                        flags: flags
+                    )
+                    self.enqueueOrSend(packet)
+                }
+                self.txAudioFrames &+= 1
+                if self.txAudioFrames == 1 || self.txAudioFrames % 50 == 0 {
+                    self.onStatus?("[WIFI_AUDIO] R2 TX frame #\(self.txAudioFrames): 3x1300B MTU-safe J7WV")
+                }
+            } else {
+                // Legacy path for any explicitly configured non-default PCM block.
+                let packet = self.makeAudioPacket(
+                    pcm: pcm,
+                    sampleRate: sampleRate,
+                    channels: channels,
+                    frames: frames,
+                    flags: 0x0001
+                )
+                self.enqueueOrSend(packet)
+            }
         }
     }
 
@@ -249,10 +270,6 @@ final class WiFiTransport {
             rxDatagrams += 1
             let data = Data(buffer[0..<count])
             let isAudio = count >= 4 && buffer[0] == 0x4A && buffer[1] == 0x37 && buffer[2] == 0x57 && buffer[3] == 0x56
-            if let reason = discoveryReason(for: data) {
-                let sourceHost = ipv4String(from: source.sin_addr)
-                considerDiscoveredJ7Host(sourceHost, reason: reason)
-            }
             if isAudio {
                 rxAudioDatagrams += 1
                 if rxAudioDatagrams == 1 || rxAudioDatagrams % 50 == 0 {
@@ -266,85 +283,9 @@ final class WiFiTransport {
         }
     }
 
-    private func discoveryReason(for data: Data) -> String? {
-        let bytes = [UInt8](data)
-        guard bytes.count >= 4 else { return nil }
-
-        // Accept only a well-formed J7WV packet from the established native audio protocol.
-        if Array(bytes[0..<4]) == Self.audioMagic {
-            guard bytes.count >= Self.audioHeaderSize else { return nil }
-            let sampleRate = readLE32(bytes, 8)
-            let channels = readLE16(bytes, 12)
-            let format = readLE16(bytes, 14)
-            let frames = readLE16(bytes, 16)
-            let flags = readLE16(bytes, 18)
-            let expected = Self.audioHeaderSize + Int(frames) * Int(channels) * 2
-            guard sampleRate == 48_000, channels == 2, format == 1,
-                  frames == 960, (flags & 0x0001) != 0, bytes.count == expected else {
-                return nil
-            }
-            return "valid J7WV audio"
-        }
-
-        // Cold-start discovery beacon emitted by the J7 helper app.
-        if Array(bytes[0..<4]) == Self.controlMagic,
-           bytes.count >= Self.controlHeaderSize,
-           bytes[4] == Self.version,
-           bytes[5] == Control.pong.rawValue {
-            let payloadLength = Int(readLE16(bytes, 10))
-            guard payloadLength == bytes.count - Self.controlHeaderSize else { return nil }
-            let payload = Data(bytes[Self.controlHeaderSize..<bytes.count])
-            guard String(data: payload, encoding: .utf8) == "CALLSHARE_DISCOVERY_R1" else { return nil }
-            return "J7WC discovery beacon"
-        }
-        return nil
-    }
-
-    private func ipv4String(from address: in_addr) -> String {
-        let value = UInt32(bigEndian: address.s_addr)
-        return "\(UInt8((value >> 24) & 0xff)).\(UInt8((value >> 16) & 0xff)).\(UInt8((value >> 8) & 0xff)).\(UInt8(value & 0xff))"
-    }
-
-    private func isPrivateIPv4(_ host: String) -> Bool {
-        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 4 else { return false }
-        let octets = parts.compactMap { Int($0) }
-        guard octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else { return false }
-        let a = octets[0], b = octets[1]
-        return a == 10 || (a == 192 && b == 168) || (a == 172 && (16...31).contains(b)) || (a == 169 && b == 254)
-    }
-
-    private func considerDiscoveredJ7Host(_ host: String, reason: String) {
-        guard isPrivateIPv4(host) else { return }
-        txQueue.async { [weak self] in
-            guard let self, self.started, self._j7Host != host else { return }
-            let oldHost = self._j7Host
-            self._j7Host = host
-            self.onStatus?("[WIFI] RECONNECT reason=AUTO_DISCOVERY old=\(oldHost) new=\(host)")
-            self.uplinkReconnectWorkItem?.cancel()
-            self.uplinkReconnectWorkItem = nil
-            self.controlReconnectWorkItem?.cancel()
-            self.controlReconnectWorkItem = nil
-            self.uplinkRetryAttempt = 0
-            self.controlRetryAttempt = 0
-            self.uplink?.cancel()
-            self.uplink = nil
-            self.controlUplink?.cancel()
-            self.controlUplink = nil
-            self.startUplink()
-            self.startControlUplink()
-            self.onStatus?("[WIFI AUTO] J7 IP DISCOVERED \(oldHost) -> \(host) via \(reason)")
-            self.onJ7HostDiscovered?(host)
-        }
-    }
-
     private func startUplink() {
-        guard started else { return }
-        guard uplink == nil else { return }
-
-        let targetHost = _j7Host
         let connection = NWConnection(
-            host: NWEndpoint.Host(targetHost),
+            host: NWEndpoint.Host(j7Host),
             port: NWEndpoint.Port(rawValue: port)!,
             using: .udp
         )
@@ -352,67 +293,22 @@ final class WiFiTransport {
 
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            self.onStatus?("[WIFI] J7 UPLINK host=\(targetHost) state=\(String(describing: state))")
-            switch state {
-            case .ready:
-                self.uplinkReconnectWorkItem?.cancel()
-                self.uplinkReconnectWorkItem = nil
-                self.uplinkRetryAttempt = 0
+            self.onStatus?("[WIFI] J7 UPLINK \(String(describing: state))")
+            if case .ready = state {
                 self.flushPendingTX()
                 self.sendHello()
-            case .failed(let error):
-                self.onStatus?("[WIFI] J7 UPLINK FAILED host=\(targetHost) error=\(error.localizedDescription)")
-                // Only clear/recover the connection if this is still the current uplink.
-                if self.uplink === connection {
-                    self.uplink = nil
-                    connection.cancel()
-                    self.scheduleUplinkReconnect(reason: "failed")
-                } else {
-                    connection.cancel()
-                }
-            case .cancelled:
-                self.onStatus?("[WIFI] J7 UPLINK CANCELLED host=\(targetHost) current=\(self.uplink === connection)")
-                // Intentional host-change/stop cancels clear `uplink` first, so only
-                // an unexpected cancellation of the active connection is restarted.
-                if self.uplink === connection {
-                    self.uplink = nil
-                    self.scheduleUplinkReconnect(reason: "unexpected-cancel")
-                }
-            case .waiting(let error):
-                self.onStatus?("[WIFI] J7 UPLINK WAITING host=\(targetHost) error=\(error.localizedDescription)")
-            default:
-                break
+            } else if case .failed = state {
+                connection.cancel()
+                self.uplink = nil
             }
         }
 
         connection.start(queue: txQueue)
     }
 
-    private func scheduleUplinkReconnect(reason: String) {
-        guard started, uplinkReconnectWorkItem == nil else { return }
-        uplinkRetryAttempt = min(uplinkRetryAttempt + 1, 6)
-        let delay = min(5.0, 0.5 * pow(2.0, Double(uplinkRetryAttempt - 1)))
-        let attempt = uplinkRetryAttempt
-        onStatus?("[WIFI] J7 UPLINK RECONNECT SCHEDULED reason=\(reason) attempt=\(attempt) delay=\(String(format: "%.1f", delay))s")
-
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.uplinkReconnectWorkItem = nil
-            guard self.started, self.uplink == nil else { return }
-            self.onStatus?("[WIFI] J7 UPLINK RECONNECT NOW attempt=\(attempt)")
-            self.startUplink()
-        }
-        uplinkReconnectWorkItem = work
-        txQueue.asyncAfter(deadline: .now() + delay, execute: work)
-    }
-
     private func startControlUplink() {
-        guard started else { return }
-        guard controlUplink == nil else { return }
-
-        let targetHost = _j7Host
         let connection = NWConnection(
-            host: NWEndpoint.Host(targetHost),
+            host: NWEndpoint.Host(j7Host),
             port: NWEndpoint.Port(rawValue: controlTxPort)!,
             using: .udp
         )
@@ -420,53 +316,15 @@ final class WiFiTransport {
 
         connection.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
-            self.onStatus?("[WIFI] CONTROL UPLINK host=\(targetHost) state=\(String(describing: state)) port=\(self.controlTxPort)")
-            switch state {
-            case .ready:
-                self.controlReconnectWorkItem?.cancel()
-                self.controlReconnectWorkItem = nil
-                self.controlRetryAttempt = 0
+            self.onStatus?("[WIFI] CONTROL UPLINK \(String(describing: state)) port=\(self.controlTxPort)")
+            if case .ready = state {
                 self.flushPendingControlTX()
-            case .failed(let error):
-                self.onStatus?("[WIFI] CONTROL UPLINK FAILED host=\(targetHost) error=\(error.localizedDescription)")
-                if self.controlUplink === connection {
-                    self.controlUplink = nil
-                    connection.cancel()
-                    self.scheduleControlReconnect(reason: "failed")
-                } else {
-                    connection.cancel()
-                }
-            case .cancelled:
-                self.onStatus?("[WIFI] CONTROL UPLINK CANCELLED host=\(targetHost) current=\(self.controlUplink === connection)")
-                if self.controlUplink === connection {
-                    self.controlUplink = nil
-                    self.scheduleControlReconnect(reason: "unexpected-cancel")
-                }
-            case .waiting(let error):
-                self.onStatus?("[WIFI] CONTROL UPLINK WAITING host=\(targetHost) error=\(error.localizedDescription)")
-            default:
-                break
+            } else if case .failed = state {
+                connection.cancel()
+                if self.controlUplink === connection { self.controlUplink = nil }
             }
         }
         connection.start(queue: txQueue)
-    }
-
-    private func scheduleControlReconnect(reason: String) {
-        guard started, controlReconnectWorkItem == nil else { return }
-        controlRetryAttempt = min(controlRetryAttempt + 1, 6)
-        let delay = min(5.0, 0.5 * pow(2.0, Double(controlRetryAttempt - 1)))
-        let attempt = controlRetryAttempt
-        onStatus?("[WIFI] CONTROL RECONNECT SCHEDULED reason=\(reason) attempt=\(attempt) delay=\(String(format: "%.1f", delay))s")
-
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.controlReconnectWorkItem = nil
-            guard self.started, self.controlUplink == nil else { return }
-            self.onStatus?("[WIFI] CONTROL RECONNECT NOW attempt=\(attempt)")
-            self.startControlUplink()
-        }
-        controlReconnectWorkItem = work
-        txQueue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func receiveLoop(_ connection: NWConnection) {
@@ -536,6 +394,7 @@ final class WiFiTransport {
         }
         guard Array(bytes[0..<4]) == Self.audioMagic else { return }
 
+        let sequence = readLE32(bytes, 4)
         let sampleRate = readLE32(bytes, 8)
         let channels = readLE16(bytes, 12)
         let format = readLE16(bytes, 14)
@@ -555,8 +414,45 @@ final class WiFiTransport {
             return
         }
 
+        if (flags & Self.audioFragmentFlag) != 0 {
+            let fragmentIndex = Int((flags & Self.audioFragmentIndexMask) >> Self.audioFragmentIndexShift)
+            guard sampleRate == 48_000, channels == 2,
+                  frames == Self.audioFragmentFrames,
+                  payload.count == Self.audioFragmentPCMBytes,
+                  fragmentIndex < Self.audioFragmentCount else {
+                onStatus?("[WIFI] AUDIO DROP bad R2 fragment header/size")
+                return
+            }
+
+            // Three consecutive sequence values form one block. Control packets
+            // share the global sequence space but are queued between audio blocks,
+            // never between a block's three fragments.
+            let baseSequence = sequence &- UInt32(fragmentIndex)
+            if fragmentAssemblyBaseSequence != baseSequence {
+                fragmentAssembly = Data(repeating: 0, count: Self.audioFullPCMBytes)
+                fragmentAssemblyBaseSequence = baseSequence
+                fragmentAssemblyMask = 0
+            }
+            let start = fragmentIndex * Self.audioFragmentPCMBytes
+            fragmentAssembly.replaceSubrange(start..<(start + payload.count), with: payload)
+            fragmentAssemblyMask |= UInt8(1 << fragmentIndex)
+
+            guard fragmentAssemblyMask == UInt8((1 << Self.audioFragmentCount) - 1) else { return }
+
+            let completePCM = fragmentAssembly
+            fragmentAssemblyBaseSequence = nil
+            fragmentAssemblyMask = 0
+            rxAudioFrames &+= 1
+            if rxAudioFrames == 1 || rxAudioFrames % 50 == 0 {
+                onStatus?("[WIFI_AUDIO] R2 RX frame #\(rxAudioFrames): reassembled 3x1280B -> 3840B")
+            }
+            onAudioPCM?(completePCM, sampleRate, channels, 960)
+            return
+        }
+
+        // Backward compatibility with the original full 960-frame J7WV packet.
         if rxAudioDatagrams <= 3 {
-            onStatus?("[WIFI_AUDIO] RX VALID J7WV rate=\(sampleRate) ch=\(channels) frames=\(frames) pcm=\(payload.count)B")
+            onStatus?("[WIFI_AUDIO] RX VALID legacy J7WV rate=\(sampleRate) ch=\(channels) frames=\(frames) pcm=\(payload.count)B")
         }
         onAudioPCM?(payload, sampleRate, channels, frames)
     }
@@ -625,7 +521,7 @@ final class WiFiTransport {
         return out
     }
 
-    private func makeAudioPacket(pcm: Data, sampleRate: UInt32, channels: UInt16, frames: UInt16) -> Data {
+    private func makeAudioPacket(pcm: Data, sampleRate: UInt32, channels: UInt16, frames: UInt16, flags: UInt16) -> Data {
         let seq = nextSequence()
         var out = Data(Self.audioMagic)
         appendLE32(&out, seq)
@@ -633,7 +529,7 @@ final class WiFiTransport {
         appendLE16(&out, channels)
         appendLE16(&out, 1) // S16_LE
         appendLE16(&out, frames)
-        appendLE16(&out, 1) // audio flag
+        appendLE16(&out, flags)
         out.append(pcm)
         return out
     }
