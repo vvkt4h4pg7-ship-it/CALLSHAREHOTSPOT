@@ -29,7 +29,6 @@ jobs:
             -configuration Release \
             CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" \
             CODE_SIGNING_ALLOWED=NO \
-
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             OTHER_LDFLAGS="-L$PWD/build/opencore-amrnb -lopencore-amrnb -lc++"
