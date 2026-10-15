@@ -3,20 +3,24 @@
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - callshareiosbuild-test
 
 jobs:
   build:
     runs-on: macos-15-intel
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Build OpenCORE AMR-NB for iPhoneOS arm64
-        run: |
-          bash Scripts/build_amr.sh
+        working-directory: ${{ github.ref_name == 'callshareiosbuild-test' && 'callshareiosbuild' || '.' }}
+        run: bash Scripts/build_amr.sh
 
       - name: Build unsigned iPhoneOS app
+        working-directory: ${{ github.ref_name == 'callshareiosbuild-test' && 'callshareiosbuild' || '.' }}
         run: |
           xcodebuild \
             -project J7Bridge.xcodeproj \
@@ -25,11 +29,13 @@ jobs:
             -configuration Release \
             CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" \
             CODE_SIGNING_ALLOWED=NO \
+
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             OTHER_LDFLAGS="-L$PWD/build/opencore-amrnb -lopencore-amrnb -lc++"
 
       - name: Package unsigned IPA
+        working-directory: ${{ github.ref_name == 'callshareiosbuild-test' && 'callshareiosbuild' || '.' }}
         run: |
           rm -rf ipa_staging
           mkdir -p ipa_staging/Payload
@@ -41,4 +47,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CALLSHARE-Final-unsigned
-          path: CALLSHARE-Final-unsigned.ipa
+          path: ${{ github.ref_name == 'callshareiosbuild-test' && 'callshareiosbuild/CALLSHARE-Final-unsigned.ipa' || 'CALLSHARE-Final-unsigned.ipa' }}
