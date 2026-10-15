@@ -17,8 +17,8 @@ final class WiFiTransport {
         case pong = 0x31
     }
 
-    // Project-level Wi-Fi signaling. Audio uses the already-proven J7WV packet
-    // format produced by j7_wifi_voice_core R1.
+    // Wi-Fi UDP audio uses the J7WV protocol: 48 kHz, stereo S16_LE.
+    // 960-frame PCM blocks are split into three MTU-safe 320-frame datagrams.
     private static let controlMagic: [UInt8] = [0x4A, 0x37, 0x57, 0x43] // J7WC
     private static let audioMagic: [UInt8] = [0x4A, 0x37, 0x57, 0x56]   // J7WV
     private static let version: UInt8 = 1
@@ -28,6 +28,11 @@ final class WiFiTransport {
     // R2 MTU-safe wire test: 3 fragments assemble into one 20 ms PCM frame.
     private static let fragmentFlag: UInt16 = 0x0002
     private static let fragmentIndexShift: UInt16 = 8
+    // Accept the alternate R2 flag layout present in earlier project snapshots.
+    // Both layouts are treated as three 320-frame pieces sharing one sequence.
+    private static let alternateFragmentFlag: UInt16 = 0x0008
+    private static let alternateFragmentIndexShift: UInt16 = 4
+    private static let alternateFragmentIndexMask: UInt16 = 0x0030
     private static let fragmentCount = 3
     private static let fragmentPCMBytes = 1280
     private static let fragmentFrames: UInt16 = 320
@@ -64,7 +69,7 @@ final class WiFiTransport {
     private var sequence: UInt32 = 0
     private var pendingTX: [Data] = []
     private var pendingControlTX: [Data] = []
-    private let maxPendingTX = 15 // 5 complete R2 audio frames at 3 UDP datagrams per frame
+    private let maxPendingTX = 15 // 5 full R2 frames x 3 datagrams/frame
 
     // R1 background resilience: recover terminal UDP uplink failures instead of
     // leaving the audio/control path nil until the user edits the J7 address.
@@ -73,6 +78,8 @@ final class WiFiTransport {
     private var uplinkRetryAttempt = 0
     private var controlRetryAttempt = 0
     private var started = false
+    private var coreDiscoveryTimer: DispatchSourceTimer?
+    private var coreDiscoveryProbeCount: UInt64 = 0
 
     init(j7Host: String = "192.168.104.12", port: UInt16 = 50005) {
         self._j7Host = j7Host
@@ -88,8 +95,10 @@ final class WiFiTransport {
             guard let self, !self.started else { return }
             self.started = true
             self.startListener()
+            // Start iPhone -> J7 UDP audio as well as the J7 -> iPhone receiver.
+            // BLE remains authoritative for call signaling.
             self.startUplink()
-            self.startControlUplink()
+            self.startCoreDiscoveryTimer()
         }
     }
 
@@ -97,6 +106,11 @@ final class WiFiTransport {
         txQueue.async { [weak self] in
             guard let self else { return }
             self.started = false
+            if let timer = self.coreDiscoveryTimer {
+                timer.setEventHandler {}
+                timer.cancel()
+                self.coreDiscoveryTimer = nil
+            }
             self.uplinkReconnectWorkItem?.cancel()
             self.uplinkReconnectWorkItem = nil
             self.controlReconnectWorkItem?.cancel()
@@ -130,7 +144,14 @@ final class WiFiTransport {
         guard !cleaned.isEmpty else { return }
         txQueue.async { [weak self] in
             guard let self else { return }
-            guard self._j7Host != cleaned else { return }
+            if self._j7Host == cleaned {
+                // Host can be set before start(); if already correct, ensure the
+                // audio uplink exists after start.
+                if self.started && self.uplink == nil {
+                    self.startUplink()
+                }
+                return
+            }
             self._j7Host = cleaned
             self.onStatus?("[WIFI] RECONNECT reason=J7_HOST_CHANGED host=\(cleaned)")
             self.uplinkReconnectWorkItem?.cancel()
@@ -143,9 +164,10 @@ final class WiFiTransport {
             self.uplink = nil
             self.controlUplink?.cancel()
             self.controlUplink = nil
+            // BLE owns call control; UDP uplink carries iPhone microphone PCM.
             if self.started {
                 self.startUplink()
-                self.startControlUplink()
+                self.sendCoreDiscoveryHello()
             }
             self.onStatus?("[WIFI] J7 HOST = \(cleaned)")
         }
@@ -211,6 +233,47 @@ final class WiFiTransport {
             if self.txAudioFrames == 1 || self.txAudioFrames % 50 == 0 {
                 self.onStatus?("[WIFI_R2] TX PCM FRAME #\(self.txAudioFrames) seq=\(frameSequence) fragments=3 datagram=1300B totalPCM=3840B")
             }
+        }
+    }
+
+    /// Periodically sends J7WC HELLO from the same socket bound to UDP 50005.
+    /// This makes the packet source port 50005, so the native J7 core can learn
+    /// the current iPhone hotspot IP and reply to the listener without relying
+    /// on a stale --peer address. Regular call controls remain BLE-only.
+    private func startCoreDiscoveryTimer() {
+        guard coreDiscoveryTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: txQueue)
+        timer.schedule(deadline: .now() + .milliseconds(100), repeating: .seconds(2), leeway: .milliseconds(200))
+        timer.setEventHandler { [weak self] in self?.sendCoreDiscoveryHello() }
+        coreDiscoveryTimer = timer
+        timer.resume()
+    }
+
+    private func sendCoreDiscoveryHello() {
+        guard started, rxSocket >= 0 else { return }
+        var destination = sockaddr_in()
+        destination.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        destination.sin_family = sa_family_t(AF_INET)
+        destination.sin_port = port.bigEndian
+        let parseResult = _j7Host.withCString { inet_pton(AF_INET, $0, &destination.sin_addr) }
+        guard parseResult == 1 else {
+            onStatus?("[WIFI HYBRID] HELLO skipped; J7 host is not IPv4: \(_j7Host)")
+            return
+        }
+        let packet = makeControlPacket(type: .hello, payload: Data())
+        let sent = packet.withUnsafeBytes { bytes -> Int in
+            guard let base = bytes.baseAddress else { return -1 }
+            return withUnsafePointer(to: &destination) { address in
+                address.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    sendto(rxSocket, base, packet.count, 0, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        coreDiscoveryProbeCount &+= 1
+        if sent != packet.count {
+            onStatus?("[WIFI HYBRID] CORE HELLO send failed errno=\(errno)")
+        } else if coreDiscoveryProbeCount == 1 || coreDiscoveryProbeCount % 15 == 0 {
+            onStatus?("[WIFI HYBRID] CORE HELLO #\(coreDiscoveryProbeCount) -> \(_j7Host):\(port)")
         }
     }
 
@@ -312,9 +375,9 @@ final class WiFiTransport {
             let expected = Self.audioHeaderSize + Int(frames) * Int(channels) * 2
             guard sampleRate == 48_000, channels == 2, format == 1,
                   (flags & 0x0001) != 0, bytes.count == expected else { return nil }
-            if (flags & Self.fragmentFlag) != 0 {
-                let fragmentIndex = Int((flags >> Self.fragmentIndexShift) & 0x3)
-                guard frames == Self.fragmentFrames, expected == 1300, fragmentIndex < Self.fragmentCount else { return nil }
+            if let fragmentIndex = fragmentIndex(from: flags) {
+                guard frames == Self.fragmentFrames, expected == 1300,
+                      fragmentIndex < Self.fragmentCount else { return nil }
                 return "valid fragmented J7WV audio"
             }
             guard frames == 960, expected == 3860 else { return nil }
@@ -331,6 +394,18 @@ final class WiFiTransport {
             let payload = Data(bytes[Self.controlHeaderSize..<bytes.count])
             guard String(data: payload, encoding: .utf8) == "CALLSHARE_DISCOVERY_R1" else { return nil }
             return "J7WC discovery beacon"
+        }
+        return nil
+    }
+
+    /// Decode the fragment index from either known R2 header layout.
+    /// The caller separately validates the audio flag and payload size.
+    private func fragmentIndex(from flags: UInt16) -> Int? {
+        if (flags & Self.fragmentFlag) != 0 {
+            return Int((flags >> Self.fragmentIndexShift) & 0x3)
+        }
+        if (flags & Self.alternateFragmentFlag) != 0 {
+            return Int((flags & Self.alternateFragmentIndexMask) >> Self.alternateFragmentIndexShift)
         }
         return nil
     }
@@ -366,8 +441,9 @@ final class WiFiTransport {
             self.uplink = nil
             self.controlUplink?.cancel()
             self.controlUplink = nil
+            // Discovery changed the host and cleared the old connection; recreate the uplink.
             self.startUplink()
-            self.startControlUplink()
+            self.sendCoreDiscoveryHello()
             self.onStatus?("[WIFI AUTO] J7 IP DISCOVERED \(oldHost) -> \(host) via \(reason)")
             self.onJ7HostDiscovered?(host)
         }
@@ -590,11 +666,10 @@ final class WiFiTransport {
             return
         }
 
-        if (flags & Self.fragmentFlag) != 0 {
-            let fragmentIndex = Int((flags >> Self.fragmentIndexShift) & 0x3)
+        if let fragmentIndex = fragmentIndex(from: flags) {
             guard frames == Self.fragmentFrames, fragmentIndex < Self.fragmentCount,
                   payload.count == Self.fragmentPCMBytes, data.count == 1300 else {
-                onStatus?("[WIFI_R2] FRAGMENT DROP seq=\(sequence) idx=\(fragmentIndex) len=\(data.count) pcm=\(payload.count)")
+                onStatus?("[WIFI_R2] FRAGMENT DROP seq=\(sequence) idx=\(fragmentIndex) len=\(data.count) pcm=\(payload.count) flags=0x\(String(flags, radix: 16))")
                 return
             }
 
@@ -622,9 +697,10 @@ final class WiFiTransport {
             rxFragmentOrder.removeAll { $0 == sequence }
             guard assembled.count == Self.fullPCMBytes else { return }
 
-            if rxAudioDatagrams <= 9 {
+            if rxAudioDatagrams <= 9 || rxAudioDatagrams % 150 == 0 {
                 onStatus?("[WIFI_R2] RX REASSEMBLED seq=\(sequence) fragments=3 datagrams=1300B pcm=\(assembled.count)B")
             }
+            // WiFiVoiceEngine expects 960 stereo frames = 3840 PCM bytes.
             onAudioPCM?(assembled, sampleRate, channels, 960)
             return
         }
